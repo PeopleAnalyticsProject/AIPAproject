@@ -63,7 +63,7 @@ Project#7 AI기반 Social Network People Analytics프로젝트
  3. 정적 사회 관계망 분석 Static Social Network Analysis: 
   <br>실무질문 - 누가 가장 연결이 많은가? 누가 부서 간 연결을 매개하는가? 영향력 있는 비공식 리더는 누구인가? 
               <br>  고립된 직원은 누구인가? 팀 간 사일로가 존재하는가?
-4. 동적 사회 관계망 분석 Dynamic Social Network Analysis
+4. 동적 사회 관계망 분석 Dynamic Social Network Analysis:
  <br> 실무질문 -  어떤 관계가 지속되고 어떤 관계가 사라지는가?  조직개편 이후 연결 구조가 바뀌었는가?  
                신규 프로젝트 이후 협업이 증가했는가?  특정 직원의 centrality는 어떻게 변했는가?  커뮤니티는 유지/분리/통합되는가? 
 5. 관계망 예측 분석 – 머신러닝 이용
