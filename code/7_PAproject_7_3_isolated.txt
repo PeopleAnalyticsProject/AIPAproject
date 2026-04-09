@@ -1,0 +1,107 @@
+import pandas as pd
+import numpy as np
+import os
+
+# 1. 파일 경로 설정
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+# 데이터 불러오기
+try:
+    df_emp = pd.read_excel(file_path, sheet_name='employees')
+    df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+except Exception as e:
+    print(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    exit()
+
+# 2. 데이터 전처리 및 필터링
+# 분석 시점(2025Q2) 및 tie_type(collaboration) 필터링
+edges = df_edges_raw[(df_edges_raw['time_id'] == '2025Q2') & 
+                     (df_edges_raw['tie_type'] == 'collaboration')].copy()
+
+# 자기 자신과의 연결 제거 (source == target)
+edges = edges[edges['source'] != edges['target']]
+
+# employees 시트에 있는 직원만 유지
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 3. 지표 계산 (Directed Metrics)
+# out_degree: 각 source별 고유 target 수
+out_degree = edges.groupby('source')['target'].nunique().reindex(df_emp['employee_id'], fill_value=0)
+# in_degree: 각 target별 고유 source 수
+in_degree = edges.groupby('target')['source'].nunique().reindex(df_emp['employee_id'], fill_value=0)
+
+# sent/received interaction (total_interaction 계산용)
+sent_int = edges.groupby('source')['interaction_count'].sum().reindex(df_emp['employee_id'], fill_value=0)
+recv_int = edges.groupby('target')['interaction_count'].sum().reindex(df_emp['employee_id'], fill_value=0)
+
+# 4. Undirected Graph 지표 계산
+# source-target 쌍을 정렬하여 무방향(Undirected) 엣지 생성
+edges['node_min'] = edges[['source', 'target']].min(axis=1)
+edges['node_max'] = edges[['source', 'target']].max(axis=1)
+
+# 무방향 기준 interaction_count 합계 (Weight)
+undirected_edges = edges.groupby(['node_min', 'node_max'])['interaction_count'].sum().reset_index()
+
+# Undirected Degree 및 Weighted Degree 계산
+# 각 노드별로 연결된 상대방 리스트 생성
+adj = {}
+weight_adj = {}
+
+for _, row in undirected_edges.iterrows():
+    u, v, w = row['node_min'], row['node_max'], row['interaction_count']
+    # Degree용
+    adj.setdefault(u, set()).add(v)
+    adj.setdefault(v, set()).add(u)
+    # Weighted Degree용
+    weight_adj[u] = weight_adj.get(u, 0) + w
+    weight_adj[v] = weight_adj.get(v, 0) + w
+
+# 5. 결과 데이터프레임 구성
+results = df_emp.copy()
+results['degree'] = results['employee_id'].map(lambda x: len(adj.get(x, [])))
+results['weighted_degree'] = results['employee_id'].map(lambda x: weight_adj.get(x, 0))
+results['out_degree'] = results['employee_id'].map(out_degree)
+results['in_degree'] = results['employee_id'].map(in_degree)
+results['total_interaction'] = results['employee_id'].map(sent_int + recv_int)
+
+# 고립 및 저연결 판정
+results['is_isolated'] = np.where(results['degree'] == 0, 1, 0)
+results['is_low_connection'] = np.where(results['degree'] <= 2, 1, 0)
+
+def get_network_status(d):
+    if d == 0: return "isolated"
+    elif d <= 2: return "low_connection"
+    else: return "connected"
+
+results['network_status'] = results['degree'].apply(get_network_status)
+
+# 6. 결과 처리 및 정렬
+# 전체 결과 정렬: degree 오름차순, total_interaction 오름차순
+results_all = results.sort_values(by=['degree', 'total_interaction']).reset_index(drop=True)
+
+# 완전 고립 직원 추출
+isolated_df = results_all[results_all['is_isolated'] == 1].copy()
+
+# 저연결 직원 추출 및 랭킹 추가
+low_conn_df = results_all[results_all['is_low_connection'] == 1].copy()
+low_conn_df['rank_low_to_high'] = low_conn_df[['degree', 'total_interaction']].apply(tuple, axis=1).rank(method='min', ascending=True)
+low_conn_df = low_conn_df.sort_values('rank_low_to_high')
+
+# 7. 결과 저장 (CSV)
+results_all.to_csv(os.path.join(output_dir, '1_SNA_total_results.csv'), index=False, encoding='utf-8-sig')
+isolated_df.to_csv(os.path.join(output_dir, '2_SNA_isolated_employees.csv'), index=False, encoding='utf-8-sig')
+low_conn_df.to_csv(os.path.join(output_dir, '3_SNA_low_connection_employees.csv'), index=False, encoding='utf-8-sig')
+
+# 8. Top 10 출력
+print("=== [Top 10] 전체 결과 (연결 취약순) ===")
+print(results_all.head(10)[['employee_id', 'name', 'degree', 'total_interaction', 'network_status']])
+
+print("\n=== [Top 10] 완전 고립 직원 ===")
+print(isolated_df.head(10)[['employee_id', 'name', 'department', 'team']])
+
+print("\n=== [Top 10] 저연결 직원 (Rank 기준) ===")
+print(low_conn_df.head(10)[['rank_low_to_high', 'employee_id', 'name', 'degree', 'total_interaction']])
+
+print(f"\n모든 분석 결과가 다음 경로에 저장되었습니다: {output_dir}")

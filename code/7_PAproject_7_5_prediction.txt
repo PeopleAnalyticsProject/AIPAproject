@@ -1,0 +1,159 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from itertools import combinations
+import os
+
+# --- 1. 환경 설정 및 데이터 로드 ---
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+df_emp = pd.read_excel(file_path, sheet_name='employees')
+df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+
+# --- 2. 데이터 전처리 ---
+# 필터링: collaboration, self-loop 제거, 유효 직원 유지
+edges = df_edges_raw[(df_edges_raw['tie_type'] == 'collaboration') &
+                     (df_edges_raw['source'] != df_edges_raw['target'])].copy()
+valid_ids = sorted(df_emp['employee_id'].unique())
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 시점 정렬
+time_ids = sorted(edges['time_id'].unique())
+
+
+# --- 3. Feature 생성 함수 정의 ---
+def get_dyad_features(G, emp_df, nodes_list):
+    dyads = list(combinations(nodes_list, 2))
+    data = []
+
+    # 직원 정보 맵핑 (속도 최적화)
+    emp_info = emp_df.set_index('employee_id').to_dict('index')
+
+    # 네트워크 기반 지표 미리 계산
+    deg_dict = dict(G.degree())
+    jaccard = {tuple(sorted([u, v])): p for u, v, p in nx.jaccard_coefficient(G, dyads)}
+    adamic = {tuple(sorted([u, v])): p for u, v, p in nx.adamic_adar_index(G, dyads)}
+    pref_att = {tuple(sorted([u, v])): p for u, v, p in nx.preferential_attachment(G, dyads)}
+
+    for u, v in dyads:
+        info_u, info_v = emp_info[u], emp_info[v]
+        pair = tuple(sorted([u, v]))
+
+        feat = {
+            'source': u, 'target': v,
+            'same_team': 1 if info_u['team'] == info_v['team'] else 0,
+            'same_department': 1 if info_u['department'] == info_v['department'] else 0,
+            'job_level_gap': abs(float(info_u['job_level']) - float(info_v['job_level'])),
+            'both_manager': 1 if info_u['is_manager'] == 1 and info_v['is_manager'] == 1 else 0,
+            'either_manager': 1 if info_u['is_manager'] == 1 or info_v['is_manager'] == 1 else 0,
+            'degree_u': deg_dict.get(u, 0),
+            'degree_v': deg_dict.get(v, 0),
+            'degree_sum': deg_dict.get(u, 0) + deg_dict.get(v, 0),
+            'degree_diff': abs(deg_dict.get(u, 0) - deg_dict.get(v, 0)),
+            'common_neighbors': len(list(nx.common_neighbors(G, u, v))),
+            'jaccard': jaccard[pair],
+            'adamic_adar': adamic[pair],
+            'preferential_attachment': pref_att[pair],
+            'previous_tie': 1 if G.has_edge(u, v) else 0,
+            'previous_edge_weight': G[u][v]['weight'] if G.has_edge(u, v) else 0
+        }
+        data.append(feat)
+    return pd.DataFrame(data)
+
+
+# --- 4. 학습 데이터셋 생성 및 모델 학습 ---
+train_frames = []
+
+for i in range(len(time_ids) - 1):
+    t_curr, t_next = time_ids[i], time_ids[i + 1]
+
+    # 시점 t의 그래프 생성
+    t_edges = edges[edges['time_id'] == t_curr].copy()
+    t_edges['n1'] = t_edges[['source', 'target']].min(axis=1)
+    t_edges['n2'] = t_edges[['source', 'target']].max(axis=1)
+    undir_t = t_edges.groupby(['n1', 'n2'])['interaction_count'].sum().reset_index()
+
+    G_t = nx.Graph()
+    G_t.add_nodes_from(valid_ids)
+    for _, row in undir_t.iterrows():
+        G_t.add_edge(row['n1'], row['n2'], weight=row['interaction_count'])
+
+    # 시점 t+1의 정답(Tie 여부)
+    next_edges = edges[edges['time_id'] == t_next]
+    next_ties = set(zip(next_edges[['source', 'target']].min(axis=1), next_edges[['source', 'target']].max(axis=1)))
+
+    # Feature 생성
+    df_step = get_dyad_features(G_t, df_emp, valid_ids)
+    df_step['y_next_tie'] = df_step.apply(lambda x: 1 if tuple(sorted([x['source'], x['target']])) in next_ties else 0,
+                                          axis=1)
+    train_frames.append(df_step)
+
+train_df = pd.concat(train_frames)
+features = ['same_team', 'same_department', 'job_level_gap', 'both_manager', 'either_manager',
+            'degree_u', 'degree_v', 'degree_sum', 'degree_diff', 'common_neighbors',
+            'jaccard', 'adamic_adar', 'preferential_attachment', 'previous_tie', 'previous_edge_weight']
+
+X_train = train_df[features]
+y_train = train_df['y_next_tie']
+
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train, y_train)
+train_auc = roc_auc_score(y_train, model.predict_proba(X_train)[:, 1])
+
+# --- 5. 다음 분기 예측 (T+1) ---
+last_t = time_ids[-1]
+last_edges = edges[edges['time_id'] == last_t].copy()
+last_edges['n1'] = last_edges[['source', 'target']].min(axis=1)
+last_edges['n2'] = last_edges[['source', 'target']].max(axis=1)
+undir_last = last_edges.groupby(['n1', 'n2'])['interaction_count'].sum().reset_index()
+
+G_last = nx.Graph()
+G_last.add_nodes_from(valid_ids)
+for _, row in undir_last.iterrows():
+    G_last.add_edge(row['n1'], row['n2'], weight=row['interaction_count'])
+
+pred_df = get_dyad_features(G_last, df_emp, valid_ids)
+pred_df['predicted_probability'] = model.predict_proba(pred_df[features])[:, 1]
+
+# 신규 관계만 필터링 (기존 관계 제외)
+pred_new_only = pred_df[pred_df['previous_tie'] == 0].sort_values('predicted_probability', ascending=False).copy()
+
+# 정보 매핑
+emp_detail = df_emp.set_index('employee_id')
+for col in ['name', 'department', 'team']:
+    pred_new_only[f'source_{col}'] = pred_new_only['source'].map(emp_detail[col])
+    pred_new_only[f'target_{col}'] = pred_new_only['target'].map(emp_detail[col])
+
+# --- 6. 결과 출력 및 저장 ---
+print("\n" + "=" * 60)
+print(f"1. [분석 기준] 시점 간 협업 예측 모델 (Logistic Regression)")
+print(f"2. [학습 데이터 요약] 샘플 수: {len(train_df)}, 학습 AUC: {train_auc:.4f}")
+print("-" * 60)
+print("3. [모델 계수 (영향력)]")
+coeff_df = pd.DataFrame({'Feature': features, 'Coeff': model.coef_[0]})
+print(coeff_df.sort_values('Coeff', ascending=False))
+print("-" * 60)
+print("4. [다음 분기 신규 협업 가능성 상위 10개]")
+top_10 = pred_new_only.head(10)
+print(top_10[['source_name', 'target_name', 'predicted_probability', 'same_team', 'common_neighbors']])
+print("-" * 60)
+
+# 7. 최종 판정
+top1 = pred_new_only.iloc[0]
+print("5. [해석 가이드]")
+print("- Coeff가 높을수록 해당 변수가 미래 협업 형성에 긍정적인 영향을 미침")
+print("- Common Neighbors: 공통 지인이 많을수록 소개를 통한 협업 가능성 증가")
+print("-" * 60)
+print("6. [최종 판정]")
+print("다음 분기에 새롭게 협업할 가능성이 높은 직원쌍 후보를 도출했습니다.")
+print(f"1위 후보: {top1['source_name']} - {top1['target_name']}")
+print(f"- 예측 확률: {top1['predicted_probability']:.2%}")
+print(f"- 소속: {top1['source_team']} / {top1['target_team']}")
+print(f"- 주요 특성: 동일부서({top1['same_department']}), 공통지인({top1['common_neighbors']}명)")
+print("=" * 60)
+
+# 결과 저장
+pred_new_only.to_excel(os.path.join(output_dir, 'SNA_Future_Collaboration_Predict.xlsx'), index=False)

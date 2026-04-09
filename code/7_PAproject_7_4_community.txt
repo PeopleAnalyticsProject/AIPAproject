@@ -1,0 +1,179 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from networkx.algorithms import community
+from sklearn.metrics import normalized_mutual_info_score
+import os
+
+# --- 1. 환경 설정 및 데이터 로드 ---
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+df_emp = pd.read_excel(file_path, sheet_name='employees')
+df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+
+# --- 2. 데이터 전처리 ---
+# 필터링: communication, self-loop 제거
+edges = df_edges_raw[(df_edges_raw['tie_type'] == 'communication') &
+                     (df_edges_raw['source'] != df_edges_raw['target'])].copy()
+
+# 유효 직원 필터링
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 시점 정렬
+time_ids = sorted(edges['time_id'].unique())
+
+# --- 3. 시점별 커뮤니티 탐지 및 지표 계산 ---
+summary_data = []
+all_comm_results = {}  # {time_id: [set(node1, node2...), set(...)]}
+
+for tid in time_ids:
+    t_edges = edges[edges['time_id'] == tid].copy()
+
+    # Undirected 통합 및 Weight 합산
+    t_edges['n1'] = t_edges[['source', 'target']].min(axis=1)
+    t_edges['n2'] = t_edges[['source', 'target']].max(axis=1)
+    undir_grouped = t_edges.groupby(['n1', 'n2'])['interaction_count'].sum().reset_index()
+
+    G = nx.Graph()
+    G.add_nodes_from(valid_ids)
+    for _, row in undir_grouped.iterrows():
+        G.add_edge(row['n1'], row['n2'], weight=row['interaction_count'])
+
+    # 커뮤니티 탐지 (Greedy Modularity)
+    comms = sorted(community.greedy_modularity_communities(G, weight='weight'), key=len, reverse=True)
+    all_comm_results[tid] = comms
+
+    # 지표 계산
+    num_comm = len(comms)
+    sizes = [len(c) for c in comms]
+    modularity = community.modularity(G, comms, weight='weight')
+
+    summary_data.append({
+        'time_id': tid,
+        'num_communities': num_comm,
+        'largest_community_size': sizes[0] if sizes else 0,
+        'average_community_size': np.mean(sizes) if sizes else 0,
+        'community_sizes_desc': ", ".join(map(str, sizes)),
+        'community_modularity': modularity
+    })
+
+summary_df = pd.DataFrame(summary_data)
+
+# --- 4. 시점 간 전이 분석 (Evolution Analysis) ---
+evolution_list = []
+overlap_details = []
+
+for i in range(len(time_ids) - 1):
+    t_curr, t_next = time_ids[i], time_ids[i + 1]
+    comms_curr = all_comm_results[t_curr]
+    comms_next = all_comm_results[t_next]
+
+    # 1) NMI 계산 (구조 유사도)
+    # 두 시점에 공통으로 존재하는 노드 기준
+    common_nodes = sorted(list(valid_ids))
+
+
+    def get_labels(comms, nodes):
+        label_map = {}
+        for idx, c in enumerate(comms):
+            for node in c: label_map[node] = idx
+        return [label_map.get(n, -1) for n in nodes]
+
+
+    labels_curr = get_labels(comms_curr, common_nodes)
+    labels_next = get_labels(comms_next, common_nodes)
+    nmi = normalized_mutual_info_score(labels_curr, labels_next)
+
+    # 2) Jaccard Overlap 기반 전이 판정
+    maintained, split, merged = 0, 0, 0
+
+    # curr -> next (Strong match 찾기)
+    matches_from_curr = []  # curr_idx별로 strong match인 next_idx 리스트
+    for c_idx, c_set in enumerate(comms_curr):
+        matches = []
+        for n_idx, n_set in enumerate(comms_next):
+            union_len = len(c_set | n_set)
+            j_overlap = len(c_set & n_set) / union_len if union_len > 0 else 0
+            if j_overlap >= 0.3:
+                matches.append(n_idx)
+                overlap_details.append(
+                    {'transition': f"{t_curr}->{t_next}", 'curr_idx': c_idx, 'next_idx': n_idx, 'overlap': j_overlap})
+        matches_from_curr.append(matches)
+
+    # next -> curr (역방향 Strong match 찾기)
+    matches_from_next = []
+    for n_idx, n_set in enumerate(comms_next):
+        matches = []
+        for c_idx, c_set in enumerate(comms_curr):
+            union_len = len(c_set | n_set)
+            j_overlap = len(c_set & n_set) / union_len if union_len > 0 else 0
+            if j_overlap >= 0.3:
+                matches.append(c_idx)
+        matches_from_next.append(matches)
+
+    # 판정 로직
+    # 유지: 1:1 대응
+    for c_idx, n_indices in enumerate(matches_from_curr):
+        if len(n_indices) == 1:
+            target_n = n_indices[0]
+            if len(matches_from_next[target_n]) == 1:
+                maintained += 1
+        elif len(n_indices) >= 2:
+            split += 1
+
+    for n_idx, c_indices in enumerate(matches_from_next):
+        if len(c_indices) >= 2:
+            merged += 1
+
+    evolution_list.append({
+        'transition': f"{t_curr} -> {t_next}",
+        'nmi_score': nmi,
+        'maintained_communities': maintained,
+        'split_communities': split,
+        'merged_communities': merged
+    })
+
+evolution_df = pd.DataFrame(evolution_list)
+overlap_df = pd.DataFrame(overlap_details)
+
+# --- 5. 결과 출력 및 저장 ---
+print("\n" + "=" * 60)
+print("1. [분석 기준] Greedy Modularity 기반 시점별 커뮤니티 탐지 및 전이 분석")
+print("-" * 60)
+print("2. [시점별 커뮤니티 요약]")
+print(summary_df)
+print("-" * 60)
+print("3. [시점 간 커뮤니티 전이 요약]")
+print(evolution_df)
+print("-" * 60)
+print("4. [해석 가이드]")
+print("- NMI: 1에 가까울수록 전반적인 커뮤니티 구조가 시점 간에 유사함을 의미함")
+print("- Modularity: 0.3 이상일 때 네트워크의 그룹화 현상이 뚜렷하다고 판단함")
+print("- Split/Merged: 조직 내 소통 그룹이 쪼개지거나(분업화) 합쳐지는(통합) 현상 추적")
+print("-" * 60)
+
+# 최종 판정
+avg_nmi = evolution_df['nmi_score'].mean() if not evolution_df.empty else 0
+sum_split = evolution_df['split_communities'].sum() if not evolution_df.empty else 0
+sum_merged = evolution_df['merged_communities'].sum() if not evolution_df.empty else 0
+
+print("5. [최종 판정]")
+verdict = ""
+if avg_nmi >= 0.6: verdict += "전반적 커뮤니티 구조 유지. "
+if sum_split >= 1: verdict += "일부 커뮤니티 분리 발생. "
+if sum_merged >= 1: verdict += "일부 커뮤니티 통합 발생. "
+
+if verdict:
+    print(f">> {verdict.strip()}\n   커뮤니티 구조는 시점에 따라 유지되면서도 일부 분리/통합이 발생한 것으로 보입니다.")
+else:
+    print(">> 커뮤니티 구조 변화가 아주 뚜렷하지는 않습니다.")
+print("=" * 60)
+
+# 파일 저장
+summary_df.to_csv(os.path.join(output_dir, 'SNA_community_summary.csv'), index=False, encoding='utf-8-sig')
+evolution_df.to_csv(os.path.join(output_dir, 'SNA_community_evolution.csv'), index=False, encoding='utf-8-sig')
+overlap_df.to_csv(os.path.join(output_dir, 'SNA_community_overlap_details.csv'), index=False, encoding='utf-8-sig')
+
+print(f"\n결과 파일이 저장되었습니다: {output_dir}")

@@ -1,0 +1,97 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# 1. 파일 경로 설정 (사용자 지정 경로)
+file_path = Path(r"C:\Users\user\Desktop\7_Paproject_7_2_SNA.xlsx")
+
+def run_sna_analysis(path):
+    # 파일 로드
+    try:
+        # 지정된 시트명으로 데이터 읽기
+        emp_df = pd.read_excel(path, sheet_name='employees')
+        edge_df = pd.read_excel(path, sheet_name='edges')
+    except Exception as e:
+        print(f"파일을 읽는 중 오류가 발생했습니다. 경로와 시트명을 확인해주세요: {e}")
+        return
+
+    # 2. 데이터 필터링 및 전처리
+    # 분석 시점: 2025Q2, tie_binary == 1, 자기 자신 제외 (source == target 제거)
+    target_time = '2025Q2'
+    filtered_edges = edge_df[
+        (edge_df['time_id'] == target_time) & 
+        (edge_df['tie_binary'] == 1) & 
+        (edge_df['source'] != edge_df['target'])
+    ].copy()
+
+    # 3. SNA 지표 계산
+    
+    # 1) out_degree: 내가 보낸(source) 고유 상대방 수
+    out_degree = filtered_edges.groupby('source')['target'].nunique().rename('out_degree')
+    
+    # 2) in_degree: 나에게 보낸(target) 고유 상대방 수
+    in_degree = filtered_edges.groupby('target')['source'].nunique().rename('in_degree')
+    
+    # 3) total_interaction: 모든 관계의 interaction_count 합계 (sent + received)
+    sent_int = filtered_edges.groupby('source')['interaction_count'].sum()
+    recv_int = filtered_edges.groupby('target')['interaction_count'].sum()
+    total_interaction = sent_int.add(recv_int, fill_value=0).rename('total_interaction')
+
+    # 4) total_unique_connections: 고유 연결 상대방 수 (Undirected 관점)
+    # 양방향 데이터를 합친 후 중복을 제거하여 계산
+    conn_list = pd.concat([
+        filtered_edges[['source', 'target']].rename(columns={'source': 'me', 'target': 'other'}),
+        filtered_edges[['target', 'source']].rename(columns={'target': 'me', 'source': 'other'})
+    ])
+    total_unique_connections = conn_list.groupby('me')['other'].nunique().rename('total_unique_connections')
+
+    # 4. 결과 데이터 통합
+    # 모든 지표를 하나의 데이터프레임으로 결합
+    metrics_df = pd.concat([total_unique_connections, out_degree, in_degree, total_interaction], axis=1)
+    
+    # employees 정보와 병합
+    final_df = emp_df.merge(metrics_df, left_on='employee_id', right_index=True, how='left')
+    
+    # 결측값(연결이 없는 경우)을 0으로 처리
+    cols_to_fill = ['total_unique_connections', 'out_degree', 'in_degree', 'total_interaction']
+    final_df[cols_to_fill] = final_df[cols_to_fill].fillna(0).astype(int)
+
+    # 5. 정렬 및 순위 부여
+    # 정렬 기준: total_unique_connections(내림) -> total_interaction(내림) -> out_degree(내림)
+    final_df = final_df.sort_values(
+        by=['total_unique_connections', 'total_interaction', 'out_degree'], 
+        ascending=False
+    ).reset_index(drop=True)
+    
+    # rank 컬럼 추가
+    final_df.insert(0, 'rank', final_df.index + 1)
+
+    # 6. 결과 저장
+    output_filename = f"SNA_Analysis_Result_{target_time}.csv"
+    final_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+
+    # 7. 출력 결과 리포트
+    print("-" * 50)
+    print(f"분석 기준 시점: {target_time}")
+    print(f"분석 대상 인원: {len(emp_df)}명")
+    print(f"활성화된 고유 관계 수: {len(filtered_edges)}건")
+    print("-" * 50)
+    print("\n[네트워크 분석 상위 10명 결과]")
+    # 주요 컬럼 위주로 출력
+    display_cols = ['rank', 'employee_id', 'name', 'department', 'team', 'total_unique_connections', 'total_interaction']
+    print(final_df[display_cols].head(10).to_string(index=False))
+    
+    # Top 1 요약 출력
+    if not final_df.empty:
+        top_1 = final_df.iloc[0]
+        print("\n" + "=" * 50)
+        print(f"[최고 연결 핵심 인물(Hub) 요약]")
+        print(f"분석 결과, 우리 조직에서 가장 연결성이 높은 인물은 {top_1['department']} {top_1['team']}팀의 {top_1['name']}님입니다.")
+        print(f"이 직원은 총 {top_1['total_unique_connections']}명의 동료와 {top_1['total_interaction']}회의 상호작용을 기록하고 있습니다.")
+        print("=" * 50)
+
+    print(f"\n상세 분석 결과가 '{output_filename}' 파일로 저장되었습니다.")
+
+# 스크립트 실행
+if __name__ == "__main__":
+    run_sna_analysis(file_path)

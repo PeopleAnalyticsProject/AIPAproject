@@ -1,0 +1,84 @@
+import pandas as pd
+import networkx as nx
+
+# 1. 데이터 로드
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_2_SNA.xlsx'
+df_employees = pd.read_excel(file_path, sheet_name='employees')
+df_edges = pd.read_excel(file_path, sheet_name='edges')
+
+# 2. 전처리 및 필터링
+# 분석 시점: 2025Q2, 자기 자신과의 연결 제거
+df_filtered = df_edges[(df_edges['time_id'] == '2025Q2') & (df_edges['source'] != df_edges['target'])].copy()
+
+# 부서 정보 매핑 (Source와 Target 각각에 부서 정보 추가)
+dept_map = df_employees.set_index('employee_id')['department'].to_dict()
+df_filtered['source_department'] = df_filtered['source'].map(dept_map)
+df_filtered['target_department'] = df_filtered['target'].map(dept_map)
+
+# 부서 간 연결 정의 (Cross-department)
+df_cross = df_filtered[df_filtered['source_department'] != df_filtered['target_department']].copy()
+
+# 3. 지표 계산을 위한 그래프 생성
+# Betweenness Centrality 계산을 위한 Undirected Graph 준비
+# (source, target) 순서를 정렬하여 같은 직원 쌍을 하나로 묶음
+df_undirected = df_filtered.copy()
+df_undirected['pair'] = df_undirected.apply(lambda x: tuple(sorted([x['source'], x['target']])), axis=1)
+df_grouped = df_undirected.groupby('pair')['interaction_count'].sum().reset_index()
+df_grouped[['node1', 'node2']] = pd.DataFrame(df_grouped['pair'].tolist(), index=df_grouped.index)
+
+G_undirected = nx.from_pandas_edgelist(df_grouped, 'node1', 'node2', edge_attr='interaction_count')
+
+# [지표 1] Betweenness Centrality (Undirected 기준)
+bet_centrality = nx.betweenness_centrality(G_undirected, weight='interaction_count', normalized=True)
+
+# 부서 간 연결(df_cross) 기반 지표 계산
+# [지표 3 & 4] Cross-dept In/Out Degree (고유 상대방 수)
+out_degree = df_cross.groupby('source')['target'].nunique()
+in_degree = df_cross.groupby('target')['source'].nunique()
+
+# [지표 2] Cross-dept Unique Connections (중복 없는 전체 고유 상대방)
+cross_unique_partners = {}
+all_cross_nodes = set(df_cross['source']).union(set(df_cross['target']))
+
+for node in all_cross_nodes:
+    partners_as_source = set(df_cross[df_cross['source'] == node]['target'])
+    partners_as_target = set(df_cross[df_cross['target'] == node]['source'])
+    cross_unique_partners[node] = len(partners_as_source.union(partners_as_target))
+
+# [지표 5] Cross-dept Total Interaction (Sent + Received)
+sent_interaction = df_cross.groupby('source')['interaction_count'].sum()
+received_interaction = df_cross.groupby('target')['interaction_count'].sum()
+
+# 4. 결과 통합
+results = []
+for emp_id in df_employees['employee_id']:
+    results.append({
+        'employee_id': emp_id,
+        'betweenness_centrality': bet_centrality.get(emp_id, 0),
+        'cross_dept_unique_connections': cross_unique_partners.get(emp_id, 0),
+        'cross_dept_out_degree': out_degree.get(emp_id, 0),
+        'cross_dept_in_degree': in_degree.get(emp_id, 0),
+        'cross_total_interaction': sent_interaction.get(emp_id, 0) + received_interaction.get(emp_id, 0)
+    })
+
+df_metrics = pd.DataFrame(results)
+
+# 직원 정보와 Merge
+df_final = pd.merge(df_employees, df_metrics, on='employee_id')
+
+# 5. 정렬 및 랭킹 부여
+df_final = df_final.sort_values(
+    by=['betweenness_centrality', 'cross_dept_unique_connections', 'cross_total_interaction'], 
+    ascending=False
+).reset_index(drop=True)
+
+df_final['rank'] = df_final.index + 1
+
+# 6. 결과 처리 및 저장
+top_10 = df_final.head(10)
+output_file = r'C:\Users\user\Desktop\SNA_Analysis_Result_2025Q2.csv'
+df_final.to_csv(output_file, index=False, encoding='utf-8-sig')
+
+print("--- SNA 분석 상위 10명 결과 ---")
+print(top_10[['rank', 'name', 'department', 'betweenness_centrality', 'cross_dept_unique_connections']])
+print(f"\n전체 분석 결과가 저장되었습니다: {output_file}")

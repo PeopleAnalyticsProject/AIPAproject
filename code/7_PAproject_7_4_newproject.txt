@@ -1,0 +1,150 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from networkx.algorithms import community
+import os
+
+# 1. 파일 경로 및 데이터 로드
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+df_emp = pd.read_excel(file_path, sheet_name='employees')
+df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+df_events = pd.read_excel(file_path, sheet_name='events')
+
+# 2. 분석 기준 설정
+PROJECT_START_TIME = "2025Q1"
+
+# 이벤트 확인
+event_check = df_events[
+    (df_events['event_type'] == 'new_project') &
+    (df_events['time_id'] == PROJECT_START_TIME) &
+    (df_events['affected_department'] == 'All')
+    ]
+
+# 데이터 필터링: collaboration만 사용, 자기 자신 제거, 유효 직원 유지
+edges = df_edges_raw[(df_edges_raw['tie_type'] == 'collaboration') &
+                     (df_edges_raw['source'] != df_edges_raw['target'])].copy()
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 속성 매핑 (team, department)
+emp_map = df_emp.set_index('employee_id')[['team', 'department']].to_dict('index')
+edges['source_team'] = edges['source'].map(lambda x: emp_map[x]['team'])
+edges['target_team'] = edges['target'].map(lambda x: emp_map[x]['team'])
+edges['source_dept'] = edges['source'].map(lambda x: emp_map[x]['department'])
+edges['target_dept'] = edges['target'].map(lambda x: emp_map[x]['department'])
+
+# 전후 시점 분리
+pre_edges = edges[edges['time_id'] < PROJECT_START_TIME]
+post_edges = edges[edges['time_id'] >= PROJECT_START_TIME]
+
+
+def calculate_sna_metrics(edge_df, nodes_df):
+    if edge_df.empty: return {k: 0 for k in range(1, 21)}
+
+    # Undirected 그래프 생성 (weight = interaction_count 합계)
+    undir = edge_df.copy()
+    undir['n1'] = undir[['source', 'target']].min(axis=1)
+    undir['n2'] = undir[['source', 'target']].max(axis=1)
+    undir_grouped = undir.groupby(['n1', 'n2'])['interaction_count'].sum().reset_index()
+
+    G = nx.Graph()
+    G.add_nodes_from(nodes_df['employee_id'])
+    for _, row in undir_grouped.iterrows():
+        G.add_edge(row['n1'], row['n2'], weight=row['interaction_count'])
+
+    # 속성 부여
+    nx.set_node_attributes(G, nodes_df.set_index('employee_id')['team'].to_dict(), 'team')
+    nx.set_node_attributes(G, nodes_df.set_index('employee_id')['department'].to_dict(), 'dept')
+
+    # 지표 계산
+    n_nodes = G.number_of_nodes()
+    n_edges = G.number_of_edges()
+    total_ties = n_edges
+
+    # 팀/부서 내부/외부 연결 계산
+    w_team = len(undir[undir['source_team'] == undir['target_team']].drop_duplicates(['n1', 'n2']))
+    b_team = total_ties - w_team
+    w_dept = len(undir[undir['source_dept'] == undir['target_dept']].drop_duplicates(['n1', 'n2']))
+    b_dept = total_ties - w_dept
+
+    # Modularity (실제 그룹 기준)
+    team_comms = [list(nodes_df[nodes_df['team'] == t]['employee_id']) for t in nodes_df['team'].unique()]
+    dept_comms = [list(nodes_df[nodes_df['department'] == d]['employee_id']) for d in nodes_df['department'].unique()]
+
+    # 탐색적 커뮤니티
+    det_comm = list(community.greedy_modularity_communities(G, weight='weight'))
+
+    return {
+        'number_of_nodes': n_nodes, 'number_of_edges': n_edges, 'total_ties': total_ties,
+        'within_team_ties': w_team, 'between_team_ties': b_team,
+        'within_team_ratio': w_team / total_ties if total_ties > 0 else 0,
+        'between_team_ratio': b_team / total_ties if total_ties > 0 else 0,
+        'within_department_ties': w_dept, 'between_department_ties': b_dept,
+        'within_department_ratio': w_dept / total_ties if total_ties > 0 else 0,
+        'between_department_ratio': b_dept / total_ties if total_ties > 0 else 0,
+        'density': nx.density(G),
+        'average_degree': sum(dict(G.degree()).values()) / n_nodes,
+        'average_weighted_degree': sum(dict(G.degree(weight='weight')).values()) / n_nodes,
+        'team_assortativity': nx.attribute_assortativity_coefficient(G, 'team'),
+        'department_assortativity': nx.attribute_assortativity_coefficient(G, 'dept'),
+        'team_modularity': community.modularity(G, team_comms, weight='weight'),
+        'department_modularity': community.modularity(G, dept_comms, weight='weight'),
+        'detected_community_modularity': community.modularity(G, det_comm, weight='weight'),
+        'num_detected_communities': len(det_comm)
+    }
+
+
+# 분석 수행
+pre_res = calculate_sna_metrics(pre_edges, df_emp)
+post_res = calculate_sna_metrics(post_edges, df_emp)
+
+# 비교 테이블 생성
+summary_df = pd.DataFrame([pre_res, post_res], index=['Pre', 'Post']).T
+summary_df['diff'] = summary_df['Post'] - summary_df['Pre']
+
+
+# 매트릭스 생성
+def get_matrix(edge_df, level):
+    return edge_df.pivot_table(index=f'source_{level}', columns=f'target_{level}',
+                               values='interaction_count', aggfunc='sum', fill_value=0)
+
+
+pre_team_mat = get_matrix(pre_edges, 'team')
+post_team_mat = get_matrix(post_edges, 'team')
+pre_dept_mat = get_matrix(pre_edges, 'dept')
+post_dept_mat = get_matrix(post_edges, 'dept')
+
+# 3. 결과 출력 및 저장
+print("\n" + "=" * 60)
+print(f"1. [분석 기준] 신규 프로젝트 시작: {PROJECT_START_TIME}")
+print(f"2. [이벤트 확인 결과]\n{event_check if not event_check.empty else '이벤트 없음'}")
+print("-" * 60)
+print("3. [전후 비교 요약]")
+print(summary_df)
+print("-" * 60)
+print("4. [협업 증가 핵심 비교]")
+core_cols = ['total_ties', 'between_team_ratio', 'between_department_ratio', 'density', 'average_degree']
+print(summary_df.loc[core_cols])
+print("-" * 60)
+
+# 최종 판정
+diff = summary_df['diff']
+is_growth = (diff['total_ties'] > 0 or diff['between_team_ratio'] > 0.05 or
+             diff['between_department_ratio'] > 0.05 or diff['density'] > 0.01 or
+             diff['average_degree'] > 0.5)
+
+print("5. [최종 판정]")
+if is_growth:
+    print(">> 결과: 신규 프로젝트 이후 협업이 증가했을 가능성이 있습니다.")
+else:
+    print(">> 결과: 신규 프로젝트 전후 협업 증가가 아주 뚜렷하지는 않습니다.")
+print("=" * 60 + "\n")
+
+# CSV 저장
+summary_df.to_csv(os.path.join(output_dir, 'SNA_project_comparison.csv'), encoding='utf-8-sig')
+pre_team_mat.to_csv(os.path.join(output_dir, 'Matrix_Pre_Team.csv'), encoding='utf-8-sig')
+post_team_mat.to_csv(os.path.join(output_dir, 'Matrix_Post_Team.csv'), encoding='utf-8-sig')
+pre_dept_mat.to_csv(os.path.join(output_dir, 'Matrix_Pre_Dept.csv'), encoding='utf-8-sig')
+post_dept_mat.to_csv(os.path.join(output_dir, 'Matrix_Post_Dept.csv'), encoding='utf-8-sig')

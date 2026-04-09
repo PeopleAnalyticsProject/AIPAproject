@@ -1,0 +1,87 @@
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# 1. 데이터 로드
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+
+# 시트별 데이터 읽기
+df_employees = pd.read_excel(file_path, sheet_name='employees')
+df_edges = pd.read_excel(file_path, sheet_name='edges')
+
+# 2. 데이터 전처리 (Edges)
+# 2025Q2 필터링 및 자기 자신과의 연결 제거
+df_filtered = df_edges[(df_edges['time_id'] == '2025Q2') & 
+                       (df_edges['source'] != df_edges['target'])].copy()
+
+# Undirected network 통합을 위해 source와 target 정렬
+# (A, B)와 (B, A)를 동일하게 만들기 위해 node_a, node_b 생성
+df_filtered['node_a'] = df_filtered.apply(lambda x: min(x['source'], x['target']), axis=1)
+df_filtered['node_b'] = df_filtered.apply(lambda x: max(x['source'], x['target']), axis=1)
+
+# edge weight (interaction_count 합계) 집계
+df_grouped = df_filtered.groupby(['node_a', 'node_b'], as_index=False)['interaction_count'].sum()
+
+# 3. NetworkX 그래프 생성
+G = nx.Graph()
+
+# 노드 속성 추가 (employees 시트 정보 활용)
+for _, row in df_employees.iterrows():
+    G.add_node(row['employee_id'], 
+               name=row['name'], 
+               department=row['department'], 
+               team=row['team'])
+
+# 엣지 추가
+for _, row in df_grouped.iterrows():
+    G.add_edge(row['node_a'], row['node_b'], weight=row['interaction_count'])
+
+# 연결이 없는 직원(isolates) 제거
+isolates = list(nx.isolates(G))
+G.remove_nodes_from(isolates)
+
+# 4. 시각화 설정 준비
+# 레이아웃: spring_layout
+pos = nx.spring_layout(G, k=0.5, seed=42)
+
+# 노드 색상: Department 기준
+departments = list(df_employees['department'].unique())
+color_map_palette = plt.cm.get_cmap('Set3', len(departments))
+dept_color_dict = {dept: color_map_palette(i) for i, dept in enumerate(departments)}
+node_colors = [dept_color_dict[G.nodes[n]['department']] for n in G.nodes()]
+
+# 노드 크기: Degree(연결 정도) 기준
+degrees = dict(G.degree())
+node_sizes = [v * 100 for v in degrees.values()] # 가독성을 위해 100 곱함
+
+# 엣지 두께: interaction_count(weight) 기준
+weights = [G[u][v]['weight'] for u, v in G.edges()]
+# 두께 조절 (최소 0.5 ~ 최대 5 정도의 범위를 갖도록 스케일링 권장)
+edge_widths = [w * 0.5 for w in weights] 
+
+# 라벨 표시: Degree 상위 15명 추출
+top_15_nodes = sorted(degrees, key=degrees.get, reverse=True)[:15]
+labels = {n: G.nodes[n]['name'] for n in top_15_nodes}
+
+# 5. 그래프 그리기
+plt.figure(figsize=(15, 10))
+
+# 엣지 그리기
+nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.3, edge_color='gray')
+
+# 노드 그리기
+nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.9)
+
+# 라벨 그리기 (상위 15명)
+nx.draw_networkx_labels(G, pos, labels=labels, font_size=10, font_family='Malgun Gothic') # 한글 폰트 설정
+
+# 범례(Legend) 추가
+legend_handles = [mpatches.Patch(color=color, label=dept) for dept, color in dept_color_dict.items()]
+plt.legend(handles=legend_handles, title="Departments", loc='upper right', bbox_to_anchor=(1.2, 1))
+
+# 제목 및 마무리
+plt.title("2025Q2 Social Network Analysis (All Tie Types: Advice, Comm, Collab)", fontsize=15)
+plt.axis('off')
+plt.tight_layout()
+plt.show()

@@ -1,0 +1,117 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+import os
+
+# --- 1. 환경 설정 및 데이터 로드 ---
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+TARGET_EMPLOYEE_ID = "E023"  # 분석 대상 직원 지정
+
+df_emp = pd.read_excel(file_path, sheet_name='employees')
+df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+
+# --- 2. 데이터 전처리 ---
+# tie_type 필터링 및 자기 자신 제거
+edges = df_edges_raw[(df_edges_raw['tie_type'] == 'communication') & 
+                     (df_edges_raw['source'] != df_edges_raw['target'])].copy()
+
+# 유효 직원 필터링
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 시점 정렬
+time_ids = sorted(edges['time_id'].unique())
+
+# 대상 직원 정보 추출
+target_info = df_emp[df_emp['employee_id'] == TARGET_EMPLOYEE_ID].iloc[0]
+
+# --- 3. 시점별 중심성 계산 ---
+ts_results = []
+
+for tid in time_ids:
+    # 해당 시점 데이터 추출
+    t_edges = edges[edges['time_id'] == tid].copy()
+    
+    # Undirected 전환 및 Weight 통합
+    t_edges['n1'] = t_edges[['source', 'target']].min(axis=1)
+    t_edges['n2'] = t_edges[['source', 'target']].max(axis=1)
+    undir_grouped = t_edges.groupby(['n1', 'n2'])['interaction_count'].sum().reset_index()
+    
+    # 그래프 생성
+    G = nx.Graph()
+    G.add_nodes_from(valid_ids)
+    for _, row in undir_grouped.iterrows():
+        G.add_edge(row['n1'], row['n2'], weight=row['interaction_count'])
+    
+    # 중심성 지표 계산 (전체 노드 대상)
+    deg_cent = nx.degree_centrality(G)
+    bet_cent = nx.betweenness_centrality(G, weight='weight')
+    eig_cent = nx.eigenvector_centrality(G, weight='weight', max_iter=1000)
+    
+    # 대상 직원의 지표 추출
+    if TARGET_EMPLOYEE_ID in G:
+        d = G.degree(TARGET_EMPLOYEE_ID)
+        wd = G.degree(TARGET_EMPLOYEE_ID, weight='weight')
+        dc = deg_cent[TARGET_EMPLOYEE_ID]
+        bc = bet_cent[TARGET_EMPLOYEE_ID]
+        ec = eig_cent[TARGET_EMPLOYEE_ID]
+    else:
+        d = wd = dc = bc = ec = 0
+        
+    ts_results.append({
+        'time_id': tid, 'degree': d, 'weighted_degree': wd,
+        'degree_centrality': dc, 'betweenness_centrality': bc, 'eigenvector_centrality': ec,
+        'number_of_nodes': G.number_of_nodes(), 'number_of_edges': G.number_of_edges()
+    })
+
+# 결과 데이터프레임 및 변화량 계산
+res_df = pd.DataFrame(ts_results)
+res_df_diff = res_df.set_index('time_id').diff().reset_index().rename(columns=lambda x: x+'_diff' if x != 'time_id' else x)
+final_df = pd.merge(res_df, res_df_diff, on='time_id')
+
+# --- 4. 시각화 (선그래프) ---
+plt.figure(figsize=(10, 6))
+plt.plot(final_df['time_id'], final_df['degree_centrality'], marker='o', label='Degree Centrality')
+plt.plot(final_df['time_id'], final_df['betweenness_centrality'], marker='s', label='Betweenness Centrality')
+plt.plot(final_df['time_id'], final_df['eigenvector_centrality'], marker='^', label='Eigenvector Centrality')
+plt.title(f"Centrality Trends: {target_info['name']} ({TARGET_EMPLOYEE_ID})")
+plt.xlabel("Time Period")
+plt.ylabel("Centrality Score")
+plt.legend()
+plt.grid(True, linestyle='--')
+plt.show()
+
+# --- 5. 결과 출력 ---
+print("\n" + "="*60)
+print("1. [분석 기준] 시점별 Undirected Communication Network 분석")
+print(f"2. [분석 대상 직원 정보] ID: {TARGET_EMPLOYEE_ID}, 성명: {target_info['name']}, 부서: {target_info['department']}")
+print("-" * 60)
+print("3. [시점별 중심성 지표 및 변화량]")
+print(final_df[['time_id', 'degree', 'degree_centrality', 'betweenness_centrality', 'eigenvector_centrality']])
+print("-" * 60)
+
+# 6. 최종 판정 로직
+first = final_df.iloc[0]
+last = final_df.iloc[-1]
+
+cond1 = last['degree'] > first['degree']
+cond2 = (last['betweenness_centrality'] - first['betweenness_centrality']) > 0.01
+cond3 = (last['eigenvector_centrality'] - first['eigenvector_centrality']) > 0.01
+
+print("4. [해석 가이드]")
+print("- Degree: 얼마나 많은 사람과 직접 소통하는가?")
+print("- Betweenness: 서로 다른 그룹 사이를 연결하는 다리 역할을 하는가?")
+print("- Eigenvector: 영향력 있는 사람들과 얼마나 가깝게 연결되어 있는가?")
+print("-" * 60)
+
+print("5. [최종 판정]")
+if any([cond1, cond2, cond3]):
+    print(f">> {TARGET_EMPLOYEE_ID} ({target_info['name']})의 중심성은 전반적으로 증가했을 가능성이 있습니다.")
+else:
+    print(f">> {TARGET_EMPLOYEE_ID} ({target_info['name']})의 중심성 변화가 아주 뚜렷하지는 않습니다.")
+print("="*60)
+
+# 7. 파일 저장
+final_df.to_csv(os.path.join(output_dir, f'SNA_Trend_{TARGET_EMPLOYEE_ID}.csv'), index=False, encoding='utf-8-sig')

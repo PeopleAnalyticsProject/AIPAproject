@@ -1,0 +1,133 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from networkx.algorithms import community
+import os
+
+# 1. 파일 불러오기
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+df_emp = pd.read_excel(file_path, sheet_name='employees')
+df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+
+# 2. 전처리 및 필터링
+# 분석 시점(2025Q2) 및 tie_type(communication) 필터링
+edges = df_edges_raw[(df_edges_raw['time_id'] == '2025Q2') & 
+                     (df_edges_raw['tie_type'] == 'communication')].copy()
+
+# 자기 자신 제거 및 유효한 직원만 유지
+edges = edges[edges['source'] != edges['target']]
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 팀 정보 매핑
+team_map = df_emp.set_index('employee_id')['team'].to_dict()
+edges['source_team'] = edges['source'].map(team_map)
+edges['target_team'] = edges['target'].map(team_map)
+
+# 팀 내/간 연결 플래그
+edges['is_within'] = edges['source_team'] == edges['target_team']
+
+# 3. 그래프 생성 (Undirected for Assortativity/Modularity)
+# 중복 엣지(A->B, B->A) 통합 및 weight 계산
+undir_edges = edges.copy()
+undir_edges['node_1'] = edges[['source', 'target']].min(axis=1)
+undir_edges['node_2'] = edges[['source', 'target']].max(axis=1)
+undir_grouped = undir_edges.groupby(['node_1', 'node_2'])['interaction_count'].sum().reset_index()
+
+G = nx.Graph()
+G.add_nodes_from(df_emp['employee_id'])
+for _, row in undir_grouped.iterrows():
+    G.add_edge(row['node_1'], row['node_2'], weight=row['interaction_count'])
+
+# 노드 속성에 팀 추가
+nx.set_node_attributes(G, team_map, 'team')
+
+# 4. 전체 지표(Global Metrics) 계산
+total_ties = len(undir_grouped)
+within_team_ties = len(undir_edges[undir_edges['is_within']].drop_duplicates(['node_1', 'node_2']))
+between_team_ties = total_ties - within_team_ties
+
+# Modularity 계산을 위한 커뮤니티 정의 (실제 팀 기준)
+teams_list = df_emp['team'].unique()
+actual_communities = [list(df_emp[df_emp['team'] == t]['employee_id']) for t in teams_list]
+team_modularity = community.modularity(G, actual_communities, weight='weight')
+
+# 탐색적 커뮤니티 탐색 (Greedy Modularity)
+detected_comm_list = list(community.greedy_modularity_communities(G, weight='weight'))
+detected_mod = community.modularity(G, detected_comm_list, weight='weight')
+
+summary_df = pd.DataFrame({
+    'metric': ['total_ties', 'within_team_ties', 'between_team_ties', 'within_team_ratio', 
+               'between_team_ratio', 'team_assortativity', 'team_modularity', 
+               'detected_community_modularity', 'num_detected_communities'],
+    'value': [
+        total_ties,
+        within_team_ties,
+        between_team_ties,
+        within_team_ties / total_ties if total_ties > 0 else 0,
+        between_team_ties / total_ties if total_ties > 0 else 0,
+        nx.attribute_assortativity_coefficient(G, 'team'),
+        team_modularity,
+        detected_mod,
+        len(detected_comm_list)
+    ]
+})
+
+# 5. 팀별 지표(Team Metrics) 계산
+team_stats = []
+for t in teams_list:
+    t_size = len(df_emp[df_emp['team'] == t])
+    # Directed 기준 계산
+    w_ties = len(edges[(edges['source_team'] == t) & (edges['target_team'] == t)])
+    b_out = len(edges[(edges['source_team'] == t) & (edges['target_team'] != t)])
+    b_in = len(edges[(edges['source_team'] != t) & (edges['target_team'] == t)])
+    b_total = b_out + b_in
+    
+    silo_idx = w_ties / (w_ties + b_total) if (w_ties + b_total) > 0 else 0
+    
+    team_stats.append({
+        'team': t, 'team_size': t_size, 'within_team_ties': w_ties,
+        'between_team_out_ties': b_out, 'between_team_in_ties': b_in,
+        'between_team_total_ties': b_total, 'silo_index': silo_idx
+    })
+team_node_metrics = pd.DataFrame(team_stats)
+
+# 6. 팀-팀 매트릭스 (Directed Interaction Count Sum)
+team_matrix = edges.pivot_table(index='source_team', columns='target_team', 
+                                values='interaction_count', aggfunc='sum', fill_value=0)
+
+# 7. 결과 저장
+summary_df.to_csv(os.path.join(output_dir, 'SNA_summary.csv'), index=False, encoding='utf-8-sig')
+team_matrix.to_csv(os.path.join(output_dir, 'SNA_team_matrix.csv'), encoding='utf-8-sig')
+team_node_metrics.to_csv(os.path.join(output_dir, 'SNA_team_metrics.csv'), index=False, encoding='utf-8-sig')
+
+# 8. 결과 출력
+print("1. [분석 기준] 2025Q2 Communication Network (Undirected Aggregated)")
+print("-" * 50)
+print("2. [전체 요약]")
+print(summary_df)
+print("-" * 50)
+print("3. [팀별 사일로 지표 (Silo Index)]")
+print(team_node_metrics[['team', 'team_size', 'silo_index']].sort_values('silo_index', ascending=False))
+print("-" * 50)
+print("4. [팀-팀 연결 매트릭스 (Interaction Count Sum)]")
+print(team_matrix)
+print("-" * 50)
+print("5. [해석 가이드]")
+print("- Team Assortativity: 1에 가까울수록 끼리끼리(동종선호) 소통함")
+print("- Silo Index: 1에 가까울수록 외부 팀과 소통 없이 팀 내부하고만 소통함")
+print("- Modularity: 0.3 이상이면 네트워크의 분절화(Silo)가 뚜렷하다고 판단")
+print("-" * 50)
+
+# 9. 최종 판정
+print("6. [최종 판정]")
+w_ratio = summary_df.loc[summary_df['metric'] == 'within_team_ratio', 'value'].values[0]
+t_assort = summary_df.loc[summary_df['metric'] == 'team_assortativity', 'value'].values[0]
+t_mod = summary_df.loc[summary_df['metric'] == 'team_modularity', 'value'].values[0]
+
+if w_ratio >= 0.7 or t_assort >= 0.2 or t_mod >= 0.2:
+    print(">> 판정 결과: 팀 간 사일로가 존재할 가능성이 있습니다.")
+else:
+    print(">> 판정 결과: 팀 간 소통이 비교적 활발하며 건강한 네트워크 구조입니다.")

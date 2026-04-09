@@ -1,0 +1,86 @@
+import pandas as pd
+import networkx as nx
+import os
+
+# 1. 파일 경로 설정
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA_Result.csv'
+
+# 2. 데이터 불러오기
+try:
+    df_emp = pd.read_excel(file_path, sheet_name='employees')
+    df_edges = pd.read_excel(file_path, sheet_name='edges')
+except Exception as e:
+    print(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    exit()
+
+# 3. 데이터 필터링 및 전처리
+# 분석 시점: 2025Q2, tie_type: advice, 자기 자신과의 연결 제거
+filtered_edges = df_edges[
+    (df_edges['time_id'] == '2025Q2') & 
+    (df_edges['tie_type'] == 'advice') & 
+    (df_edges['source'] != df_edges['target'])
+].copy()
+
+# Undirected Graph 통합을 위해 source, target 정렬 (A-B와 B-A를 동일하게 취급)
+# interaction_count 합계 계산
+filtered_edges['node1'] = filtered_edges[['source', 'target']].min(axis=1)
+filtered_edges['node2'] = filtered_edges[['source', 'target']].max(axis=1)
+
+undir_edges = filtered_edges.groupby(['node1', 'node2'])['interaction_count'].sum().reset_index()
+
+# 4. NetworkX 그래프 생성 (Undirected)
+G = nx.Graph()
+for _, row in undir_edges.iterrows():
+    G.add_edge(row['node1'], row['node2'], weight=row['interaction_count'])
+
+# 5. 지표 계산
+# 1) Eigenvector Centrality (수렴 실패 시 numpy 버전 사용)
+try:
+    eig_cent = nx.eigenvector_centrality(G, weight='weight', max_iter=1000)
+except nx.PowerIterationFailedConvergence:
+    eig_cent = nx.eigenvector_centrality_numpy(G, weight='weight')
+
+# 2) Degree (연결 정도)
+degree_dict = dict(G.degree())
+
+# 3) Weighted Degree (가중 연결 정도)
+weighted_degree_dict = dict(G.degree(weight='weight'))
+
+# 6. 결과 데이터프레임 생성 및 결합
+nodes = list(G.nodes())
+results = pd.DataFrame({
+    'employee_id': nodes,
+    'eigenvector_centrality': [eig_cent.get(n, 0) for n in nodes],
+    'degree': [degree_dict.get(n, 0) for n in nodes],
+    'weighted_degree': [weighted_degree_dict.get(n, 0) for n in nodes]
+})
+
+# employees 정보와 병합
+final_df = pd.merge(df_emp, results, on='employee_id', how='left').fillna(0)
+
+# 7. 비공식 리더 후보 분석 (is_manager == 0) 및 정렬
+informal_leaders = final_df[final_df['is_manager'] == 0].copy()
+
+# 정렬: Eigenvector -> Degree -> Weighted Degree (내림차순)
+informal_leaders = informal_leaders.sort_values(
+    by=['eigenvector_centrality', 'degree', 'weighted_degree'], 
+    ascending=False
+)
+
+# 순위(Rank) 추가
+informal_leaders['rank'] = range(1, len(informal_leaders) + 1)
+
+# 상위 10명 추출
+top_10_leaders = informal_leaders.head(10)
+
+# 8. 결과 출력 및 저장
+print("--- 비공식 리더(Informal Leader) 상위 10명 분석 결과 ---")
+print(top_10_leaders[['rank', 'employee_id', 'name', 'department', 'eigenvector_centrality', 'degree']])
+
+# CSV 파일로 저장
+try:
+    informal_leaders.to_csv(output_path, index=False, encoding='utf-8-sig')
+    print(f"\n분석 결과가 저장되었습니다: {output_path}")
+except Exception as e:
+    print(f"파일 저장 중 오류가 발생했습니다: {e}")

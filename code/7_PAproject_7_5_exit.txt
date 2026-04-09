@@ -1,0 +1,163 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+import os
+
+# --- 1. 데이터 로드 및 환경 설정 ---
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+try:
+    df_emp = pd.read_excel(file_path, sheet_name='employees')
+    df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+except Exception as e:
+    print(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    exit()
+
+# --- 2. 데이터 전처리 ---
+# communication 필터링 및 자기 자신 제거
+edges = df_edges_raw[(df_edges_raw['tie_type'] == 'communication') & 
+                     (df_edges_raw['source'] != df_edges_raw['target'])].copy()
+
+# employees 시트에 있는 직원만 유지
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 시점 정렬
+time_ids = sorted(edges['time_id'].unique())
+emp_info = df_emp.set_index('employee_id').to_dict('index')
+
+# --- 3. 시점별 직원 Feature 계산 함수 ---
+def get_employee_features(time_id, edge_df, emp_df):
+    t_edges = edge_df[edge_df['time_id'] == time_id].copy()
+    
+    # Directed Graph (In/Out Degree용)
+    DG = nx.DiGraph()
+    DG.add_nodes_from(valid_ids)
+    for _, row in t_edges.iterrows():
+        DG.add_edge(row['source'], row['target'], weight=row['interaction_count'])
+        
+    # Undirected Graph (Centrality, Weighted Degree용)
+    undir = t_edges.copy()
+    undir['n1'] = undir[['source', 'target']].min(axis=1)
+    undir['n2'] = undir[['source', 'target']].max(axis=1)
+    undir_grouped = undir.groupby(['n1', 'n2'])['interaction_count'].sum().reset_index()
+    
+    G = nx.Graph()
+    G.add_nodes_from(valid_ids)
+    for _, row in undir_grouped.iterrows():
+        G.add_edge(row['n1'], row['n2'], weight=row['interaction_count'])
+    
+    # 지표 계산
+    deg = dict(G.degree())
+    w_deg = dict(G.degree(weight='weight'))
+    deg_cent = nx.degree_centrality(G)
+    bet_cent = nx.betweenness_centrality(G, weight='weight')
+    eig_cent = nx.eigenvector_centrality(G, weight='weight', max_iter=1000)
+    in_deg = dict(DG.in_degree())
+    out_deg = dict(DG.out_degree())
+    
+    features = []
+    for eid in valid_ids:
+        info = emp_info[eid]
+        d = deg.get(eid, 0)
+        
+        # 팀/부서 간 연결 계산
+        cross_team = 0
+        cross_dept = 0
+        for neighbor in G.neighbors(eid):
+            if emp_info[neighbor]['team'] != info['team']: cross_team += 1
+            if emp_info[neighbor]['department'] != info['department']: cross_dept += 1
+            
+        features.append({
+            'employee_id': eid,
+            'time_id': time_id,
+            'job_level': info['job_level'],
+            'is_manager': info['is_manager'],
+            'degree': d,
+            'weighted_degree': w_deg.get(eid, 0),
+            'degree_centrality': deg_cent.get(eid, 0),
+            'betweenness_centrality': bet_cent.get(eid, 0),
+            'eigenvector_centrality': eig_cent.get(eid, 0),
+            'out_degree': out_deg.get(eid, 0),
+            'in_degree': in_deg.get(eid, 0),
+            'cross_team_degree': cross_team,
+            'cross_department_degree': cross_dept,
+            'cross_team_ratio': cross_team / d if d > 0 else 0,
+            'cross_department_ratio': cross_dept / d if d > 0 else 0
+        })
+    return pd.DataFrame(features)
+
+# --- 4. 학습 데이터셋 생성 (t vs t+1) ---
+all_features = []
+for tid in time_ids:
+    all_features.append(get_employee_features(tid, edges, df_emp))
+
+full_feat_df = pd.concat(all_features)
+train_frames = []
+
+for i in range(len(time_ids) - 1):
+    t_curr, t_next = time_ids[i], time_ids[i+1]
+    df_t = full_feat_df[full_feat_df['time_id'] == t_curr].copy()
+    df_t1 = full_feat_df[full_feat_df['time_id'] == t_next][['employee_id', 'degree']].rename(columns={'degree': 'degree_next'})
+    
+    merged = pd.merge(df_t, df_t1, on='employee_id')
+    # 이탈 위험 정의 (degree 50% 이상 감소)
+    merged['degree_drop_ratio'] = (merged['degree'] - merged['degree_next']) / merged['degree']
+    merged['exit_risk_next'] = np.where((merged['degree'] > 0) & (merged['degree_drop_ratio'] >= 0.5), 1, 0)
+    train_frames.append(merged)
+
+train_df = pd.concat(train_frames)
+feature_cols = ['job_level', 'is_manager', 'degree', 'weighted_degree', 'degree_centrality', 
+                'betweenness_centrality', 'eigenvector_centrality', 'out_degree', 'in_degree', 
+                'cross_team_ratio', 'cross_department_ratio']
+
+# --- 5. 모델 학습 ---
+X_train = train_df[feature_cols]
+y_train = train_df['exit_risk_next']
+
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train, y_train)
+train_auc = roc_auc_score(y_train, model.predict_proba(X_train)[:, 1])
+
+# --- 6. 다음 분기 위험 예측 (마지막 시점 T 기준) ---
+last_t = time_ids[-1]
+last_feat = full_feat_df[full_feat_df['time_id'] == last_t].copy()
+last_feat['predicted_exit_risk_probability'] = model.predict_proba(last_feat[feature_cols])[:, 1]
+
+# 결과 정렬 및 정보 매핑
+result_df = pd.merge(last_feat, df_emp[['employee_id', 'name', 'department', 'team']], on='employee_id')
+result_df = result_df.sort_values('predicted_exit_risk_probability', ascending=False)
+
+# --- 7. 결과 출력 ---
+print("\n" + "="*60)
+print(f"1. [분석 기준] 네트워크 이탈 위험(다음 분기 Degree 50% 급감) 예측")
+print(f"2. [학습 데이터 요약] 시점 수: {len(time_ids)-1}, 샘플 수: {len(train_df)}, 학습 AUC: {train_auc:.4f}")
+print("-" * 60)
+print("3. [모델 계수 (영향력)]")
+coeff = pd.DataFrame({'Feature': feature_cols, 'Coefficient': model.coef_[0]}).sort_values('Coefficient', ascending=False)
+print(coeff)
+print("-" * 60)
+print("4. [다음 분기 네트워크 이탈 위험 상위 10명]")
+print(result_df.head(10)[['employee_id', 'name', 'department', 'predicted_exit_risk_probability', 'degree']])
+print("-" * 60)
+
+# 최종 판정
+top1 = result_df.iloc[0]
+print("5. [해석 가이드]")
+print("- 계수(+)값이 클수록 해당 지표가 높을 때 이탈(고립) 위험이 높음을 의미")
+print("- Betweenness/Eigenvector가 낮은데 위험도가 높다면 네트워크의 변두리에 위치함을 의미")
+print("-" * 60)
+print("6. [최종 판정]")
+print("다음 분기에 네트워크 이탈 위험(=degree 급감 위험)이 높은 직원 후보를 도출했습니다.")
+print(f"1위 후보: {top1['name']} ({top1['employee_id']})")
+print(f"- 예측 위험 확률: {top1['predicted_exit_risk_probability']:.2%}")
+print(f"- 현재 지표: Degree({top1['degree']}), Weighted({top1['weighted_degree']:.1f}), "
+      f"부서간협업비중({top1['cross_department_ratio']:.2%})")
+print(f"- 중심성: 매개({top1['betweenness_centrality']:.4f}), 영향력({top1['eigenvector_centrality']:.4f})")
+print("="*60)
+
+# 파일 저장
+result_df.to_csv(os.path.join(output_dir, 'SNA_Exit_Risk_Prediction.csv'), index=False, encoding='utf-8-sig')

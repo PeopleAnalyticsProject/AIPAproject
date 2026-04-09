@@ -1,0 +1,145 @@
+import pandas as pd
+import numpy as np
+import os
+
+# 1. 파일 경로 및 설정
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+# 2. 데이터 불러오기 및 기본 필터링
+try:
+    df_emp = pd.read_excel(file_path, sheet_name='employees')
+    df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+except Exception as e:
+    print(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    exit()
+
+# [분석 기준] tie_type: communication, self-loop 제거, 유효 직원 필터링
+edges = df_edges_raw[(df_edges_raw['tie_type'] == 'communication') &
+                     (df_edges_raw['source'] != df_edges_raw['target'])].copy()
+
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 동일 시점, 동일 dyad(source, target) 합산
+edges = edges.groupby(['time_id', 'source', 'target'])['interaction_count'].sum().reset_index()
+
+# 시점 정렬 (2024Q1, 2024Q2... 순서)
+time_list = sorted(edges['time_id'].unique())
+
+# 직원 속성 매핑 함수
+emp_info = df_emp.set_index('employee_id')[['name', 'department', 'team']].to_dict('index')
+
+
+def map_employee_details(target_df):
+    if target_df.empty: return target_df
+    for side in ['source', 'target']:
+        target_df[f'{side}_name'] = target_df[side].map(lambda x: emp_info.get(x, {}).get('name'))
+        target_df[f'{side}_department'] = target_df[side].map(lambda x: emp_info.get(x, {}).get('department'))
+        target_df[f'{side}_team'] = target_df[side].map(lambda x: emp_info.get(x, {}).get('team'))
+    return target_df
+
+
+# 3. 동적 지표 계산 (시점 간 전이)
+summary_list = []
+persisted_list, dissolved_list, formed_list = [], [], []
+
+if len(time_list) < 2:
+    print("! 경고: 분석 가능한 시점(time_id)이 2개 미만입니다. 동적 전이 분석을 수행할 수 없습니다.")
+else:
+    for i in range(len(time_list) - 1):
+        t, t1 = time_list[i], time_list[i + 1]
+
+        # 각 시점의 관계 집합
+        set_t = set(zip(edges[edges['time_id'] == t]['source'], edges[edges['time_id'] == t]['target']))
+        set_t1 = set(zip(edges[edges['time_id'] == t1]['source'], edges[edges['time_id'] == t1]['target']))
+
+        # 교집합, 차집합 연산
+        persisted = set_t & set_t1
+        dissolved = set_t - set_t1
+        formed = set_t1 - set_t
+
+        # 지표 산출
+        ties_t, ties_t1 = len(set_t), len(set_t1)
+        p, d, f = len(persisted), len(dissolved), len(formed)
+
+        trans_name = f"{t} -> {t1}"
+        summary_list.append({
+            'transition': trans_name, 'ties_t': ties_t, 'ties_t1': ties_t1,
+            'persisted_ties': p, 'dissolved_ties': d, 'formed_ties': f,
+            'persistence_rate': p / ties_t if ties_t > 0 else 0,
+            'dissolution_rate': d / ties_t if ties_t > 0 else 0,
+            'formation_rate': f / ties_t1 if ties_t1 > 0 else 0
+        })
+
+        # 상세 데이터프레임 생성
+        for edge_set, target_list in zip([persisted, dissolved, formed], [persisted_list, dissolved_list, formed_list]):
+            if edge_set:
+                tmp = pd.DataFrame(list(edge_set), columns=['source', 'target'])
+                tmp['transition'] = trans_name
+                target_list.append(tmp)
+
+# 결과 데이터프레임 병합 및 속성 매핑
+summary_df = pd.DataFrame(summary_list)
+persisted_ties_df = map_employee_details(pd.concat(persisted_list) if persisted_list else pd.DataFrame())
+dissolved_ties_df = map_employee_details(pd.concat(dissolved_list) if dissolved_list else pd.DataFrame())
+formed_ties_df = map_employee_details(pd.concat(formed_list) if formed_list else pd.DataFrame())
+
+# 4. 관계 이력 테이블 (Tie History)
+tie_history = edges.pivot_table(index=['source', 'target'], columns='time_id',
+                                values='interaction_count', aggfunc='sum').fillna(0)
+tie_history['total_presence_count'] = (tie_history > 0).sum(axis=1)
+tie_history = map_employee_details(tie_history.reset_index())
+
+# 5. 결과 출력 (Print)
+print("\n" + "=" * 60)
+print("1. [분석 기준] Communication Network Directed Dyad 분석")
+print(f"2. [분석 대상 time_id 목록] {time_list}")
+print("-" * 60)
+print("3. [시점 간 전이 요약]")
+print(summary_df if not summary_df.empty else "분석 데이터 없음")
+print("-" * 60)
+print("4. [해석 가이드]")
+print("- Persistence Rate: 기존 관계가 유지된 비율. 높을수록 소통 채널이 안정적임.")
+print("- Dissolution Rate: 관계가 끊긴 비율. 조직 개편이나 이직 등이 영향을 줄 수 있음.")
+print("-" * 60)
+
+print("5. [가장 오래 지속된 관계 상위 10개]")
+if not tie_history.empty:
+    print(tie_history.sort_values('total_presence_count', ascending=False).head(10)[
+              ['source_name', 'target_name', 'total_presence_count']])
+
+print("\n6. [가장 최근 전이에서 사라진 관계 상위 10개]")
+if not dissolved_ties_df.empty:
+    last_trans = summary_df['transition'].iloc[-1]
+    latest_dissolved = dissolved_ties_df[dissolved_ties_df['transition'] == last_trans].head(10)
+    if not latest_dissolved.empty:
+        print(latest_dissolved[['source_name', 'target_name', 'transition']])
+    else:
+        print("최근 전이에서 사라진 관계가 없습니다.")
+else:
+    print("사라진 관계 데이터가 존재하지 않습니다.")
+
+print("-" * 60)
+print("7. [최종 판정]")
+if not summary_df.empty:
+    avg_p = summary_df['persistence_rate'].mean()
+    avg_d = summary_df['dissolution_rate'].mean()
+    if avg_p >= 0.6 and avg_d < 0.4:
+        print(">> 커뮤니케이션 관계는 전반적으로 비교적 안정적으로 유지되고 있습니다.")
+    elif avg_d >= 0.5:
+        print(">> 커뮤니케이션 관계는 시점 간 소멸 비율이 높아 변동성이 큰 편입니다.")
+    else:
+        print(">> 커뮤니케이션 관계는 일부는 유지되고 일부는 사라지는 중간 수준의 변동성을 보입니다.")
+else:
+    print("데이터 부족으로 최종 판정이 불가합니다.")
+print("=" * 60 + "\n")
+
+# 6. 결과 저장
+summary_df.to_csv(os.path.join(output_dir, '1_transition_summary.csv'), index=False, encoding='utf-8-sig')
+persisted_ties_df.to_csv(os.path.join(output_dir, '2_persisted_ties.csv'), index=False, encoding='utf-8-sig')
+dissolved_ties_df.to_csv(os.path.join(output_dir, '3_dissolved_ties.csv'), index=False, encoding='utf-8-sig')
+formed_ties_df.to_csv(os.path.join(output_dir, '4_formed_ties.csv'), index=False, encoding='utf-8-sig')
+tie_history.to_csv(os.path.join(output_dir, '5_tie_history.csv'), index=False, encoding='utf-8-sig')
+
+print(f"파일 저장 완료: {output_dir}")

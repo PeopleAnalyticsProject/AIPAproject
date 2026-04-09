@@ -1,0 +1,141 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+import statsmodels.api as sm
+from scipy.stats import pearsonr, spearmanr
+import os
+
+# --- 1. 환경 설정 및 데이터 로드 ---
+file_path = r'C:\Users\user\Desktop\7_Paproject_7_3_SNA.xlsx'
+output_dir = os.path.dirname(file_path)
+
+df_emp = pd.read_excel(file_path, sheet_name='employees')
+df_edges_raw = pd.read_excel(file_path, sheet_name='edges')
+df_burnout = pd.read_excel(file_path, sheet_name='employee_time')
+
+# --- 2. 데이터 전처리 ---
+# communication 필터링, 자기 자신 제거, 유효 직원 유지
+edges = df_edges_raw[(df_edges_raw['tie_type'] == 'communication') &
+                     (df_edges_raw['source'] != df_edges_raw['target'])].copy()
+valid_ids = set(df_emp['employee_id'])
+edges = edges[edges['source'].isin(valid_ids) & edges['target'].isin(valid_ids)]
+
+# 시점 정렬
+time_ids = sorted(df_burnout['time_id'].unique())
+
+# --- 3. 시점별 네트워크 지표 산출 ---
+sna_results = []
+
+for tid in time_ids:
+    t_edges = edges[edges['time_id'] == tid].copy()
+
+    # 무방향 그래프(Undirected) 변환 및 Weight 합산
+    t_edges['n1'] = t_edges[['source', 'target']].min(axis=1)
+    t_edges['n2'] = t_edges[['source', 'target']].max(axis=1)
+    undir_grouped = t_edges.groupby(['n1', 'n2'])['interaction_count'].sum().reset_index()
+
+    G = nx.Graph()
+    G.add_nodes_from(valid_ids)
+    for _, row in undir_grouped.iterrows():
+        G.add_edge(row['n1'], row['n2'], weight=row['interaction_count'])
+
+    # 지표 계산
+    deg = dict(G.degree())
+    w_deg = dict(G.degree(weight='weight'))
+    bet_cent = nx.betweenness_centrality(G, weight='weight')
+    eig_cent = nx.eigenvector_centrality(G, weight='weight', max_iter=1000)
+
+    for eid in valid_ids:
+        sna_results.append({
+            'time_id': tid,
+            'employee_id': eid,
+            'degree': deg.get(eid, 0),
+            'weighted_degree': w_deg.get(eid, 0),
+            'betweenness_centrality': bet_cent.get(eid, 0),
+            'eigenvector_centrality': eig_cent.get(eid, 0)
+        })
+
+sna_df = pd.DataFrame(sna_results)
+
+# --- 4. 데이터 통합 (Panel 구성) ---
+# SNA 지표 + 번아웃 데이터 + 직원 정보
+panel = pd.merge(sna_df, df_burnout, on=['time_id', 'employee_id'], how='inner')
+panel = pd.merge(panel, df_emp, on='employee_id', how='left')
+
+# 시차 변수 생성 (t 시점의 브로커 부담 -> t+1 시점의 번아웃)
+panel = panel.sort_values(['employee_id', 'time_id'])
+panel['next_burnout_risk'] = panel.groupby('employee_id')['burnout_risk'].shift(-1)
+
+
+# --- 5. 상관분석 및 회귀분석 ---
+def get_corr(df, x_col, y_col):
+    clean = df[[x_col, y_col]].dropna()
+    if len(clean) < 2: return (0, 1), (0, 1)
+    p_corr = pearsonr(clean[x_col], clean[y_col])
+    s_corr = spearmanr(clean[x_col], clean[y_col])
+    return p_corr, s_corr
+
+
+corr_curr = get_corr(panel, 'betweenness_centrality', 'burnout_risk')
+corr_lag = get_corr(panel, 'betweenness_centrality', 'next_burnout_risk')
+
+
+# 회귀분석 함수
+def run_regression(df, y_col, x_cols):
+    clean = df[x_cols + [y_col]].dropna()
+    X = clean[x_cols].astype(float)
+    X = sm.add_constant(X)
+    y = clean[y_col]
+    model = sm.OLS(y, X).fit()
+    return model
+
+
+features = ['betweenness_centrality', 'degree', 'weighted_degree', 'eigenvector_centrality', 'job_level', 'is_manager']
+reg_curr = run_regression(panel, 'burnout_risk', features)
+reg_lag = run_regression(panel, 'next_burnout_risk', features)
+
+# --- 6. 고위험 브로커 식별 ---
+b_threshold = panel['betweenness_centrality'].quantile(0.8)
+r_threshold = panel['burnout_risk'].quantile(0.8)
+panel['high_risk_broker'] = np.where((panel['betweenness_centrality'] >= b_threshold) &
+                                     (panel['burnout_risk'] >= r_threshold), 1, 0)
+
+high_risk_list = panel[panel['high_risk_broker'] == 1].sort_values('betweenness_centrality', ascending=False)
+
+# --- 7. 결과 출력 ---
+print("\n" + "=" * 60)
+print("1. [분석 기준] 브로커 부담(Betweenness)과 Burnout Risk 간의 관계 분석")
+print("-" * 60)
+print("2. [상관분석 결과]")
+print(f"- 동시점(Pearson): r={corr_curr[0][0]:.4f}, p={corr_curr[0][1]:.4f}")
+print(f"- 시차(Pearson, t -> t+1): r={corr_lag[0][0]:.4f}, p={corr_lag[0][1]:.4f}")
+print("-" * 60)
+print("3. [회귀분석 요약 (동시점)]")
+print(reg_curr.summary().tables[1])
+print("\n4. [회귀분석 요약 (시차: 다음 분기 번아웃 예측)]")
+print(reg_lag.summary().tables[1])
+print("-" * 60)
+print("5. [고위험 브로커 상위 10명]")
+print(high_risk_list.head(10)[['employee_id', 'name', 'department', 'betweenness_centrality', 'burnout_risk']])
+
+print("-" * 60)
+print("6. [해석 가이드]")
+print("- Betweenness Centrality: 정보의 가교 역할을 수행하는 정도로, 높을수록 소통 부담이 큼")
+print("- High Risk Broker: 소통 영향력도 최상위권이면서 현재 심리적 소진도 높은 관리 대상자")
+print("-" * 60)
+
+# 8. 최종 판정
+p_val_curr = corr_curr[0][1]
+coef_curr = corr_curr[0][0]
+p_val_reg = reg_lag.pvalues['betweenness_centrality']
+coef_reg = reg_lag.params['betweenness_centrality']
+
+print("7. [최종 판정]")
+if (p_val_curr < 0.05 and coef_curr > 0) or (p_val_reg < 0.05 and coef_reg > 0):
+    print(">> 판정: 브로커 부담이 높은 직원은 burnout risk가 높을 가능성이 있습니다.")
+else:
+    print(">> 판정: 브로커 부담과 burnout risk 간의 뚜렷한 양(+)의 관계는 강하지 않을 수 있습니다.")
+print("=" * 60)
+
+# 파일 저장
+high_risk_list.to_csv(os.path.join(output_dir, 'SNA_High_Risk_Brokers.csv'), index=False, encoding='utf-8-sig')
