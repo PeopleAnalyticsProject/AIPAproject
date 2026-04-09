@@ -58,7 +58,7 @@ Project#6 AI기반 교육·역량개발 People Analytics프로젝트
    <br>Machine Learning - 협업필터링, 콘텐츠필터링, 하이브리드필터링 
 
 Project#7 AI기반 Social Network People Analytics프로젝트
- 1. 사회관계망분석(social network analysis의 핵심개념: AI를 이용하여 실무질문으로 부터의 이론정리
+ 1. 사회관계망분석(social network analysis)의 핵심개념: AI를 이용하여 실무질문으로 부터의 이론정리
  2. 사내 메신저 로그로 부터 사회관계망 분석데이터 도출
  3. 정적 사회 관계망 분석 Static Social Network Analysis: 
   <br>실무질문 - 누가 가장 연결이 많은가? 누가 부서 간 연결을 매개하는가? 영향력 있는 비공식 리더는 누구인가? 
