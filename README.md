@@ -467,8 +467,14 @@ Email: Kimzinc@kookmin.ac.kr
 ---
 
 ## License
+This repository is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
 
-This project is licensed under the MIT License.
+본 저장소의 강의자료, 실습자료, 코드, 데이터, AI 프롬프트 및 관련 문서는  
+Creative Commons Attribution-NonCommercial 4.0 International License, 즉 CC BY-NC 4.0에 따라 배포됩니다.
 
-본 저장소는 MIT License에 따라 배포됩니다.  
-자세한 내용은 `LICENSE` 파일을 참고하시기 바랍니다.
+사용자는 출처를 표시하는 조건으로 본 자료를 복사, 공유, 수정, 재배포할 수 있으나,  
+상업적 목적으로 사용할 수 없습니다.
+
+자세한 내용은 `LICENSE` 파일 또는 아래 공식 라이선스 페이지를 참고하시기 바랍니다.
+
+https://creativecommons.org/licenses/by-nc/4.0/
