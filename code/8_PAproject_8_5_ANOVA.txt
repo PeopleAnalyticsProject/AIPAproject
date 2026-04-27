@@ -1,0 +1,98 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from google import genai
+import os
+
+# 1. 파일 경로 및 설정
+file_path = r'C:\Users\user\Desktop\8_PAproject_8_2_grouping.xlsx'
+output_path = r'C:\Users\user\Desktop\KMeans_ANOVA_Analysis_Result.xlsx'
+
+# 2. 데이터 불러오기 및 전처리
+try:
+    df = pd.read_excel(file_path)
+    features = ['age', 'tenure_years', 'goal_difficulty', 'performance', 
+                'engagement', 'stress', 'collaboration', 'leadership']
+    
+    # 분석 데이터 추출 및 결측치 제거
+    data_analysis = df[features].dropna().copy()
+    
+    # K-means를 위한 표준화
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(data_analysis)
+except Exception as e:
+    print(f"오류 발생: {e}")
+    exit()
+
+# 3. K-means 군집 분석 (k=3)
+kmeans = KMeans(n_clusters=3, n_init='auto', random_state=42)
+data_analysis['Cluster'] = kmeans.fit_predict(scaled_data)
+
+# 4. ANOVA 분석 (performance 변수 대상)
+# 집단별 performance 데이터 분리
+groups = [data_analysis[data_analysis['Cluster'] == i]['performance'] for i in range(3)]
+f_stat, p_val = stats.f_oneway(*groups)
+
+# 5. 사후검증 (Tukey's HSD)
+# ANOVA 결과가 유의미할 경우(p < 0.05) 사후검증 수행
+tukey = pairwise_tukeyhsd(endog=data_analysis['performance'], 
+                          groups=data_analysis['Cluster'], 
+                          alpha=0.05)
+tukey_summary = pd.DataFrame(data=tukey.summary().data[1:], columns=tukey.summary().data[0])
+
+# 6. Gemini 해석 요청 준비
+cluster_means = data_analysis.groupby('Cluster').mean()
+anova_result_text = f"F-statistic: {f_stat:.4f}, p-value: {p_val:.4f}"
+
+prompt_context = f"""
+다음은 조직 구성원 데이터를 K-means(k=3)로 군집화한 뒤, 
+집단별 'performance(성과)'의 차이를 ANOVA로 분석한 결과입니다.
+
+[1. 군집별 변수 평균]
+{cluster_means.to_string()}
+
+[2. ANOVA 분석 결과 (Target: performance)]
+{anova_result_text}
+
+[3. Tukey HSD 사후검증 결과]
+{tukey_summary.to_string()}
+
+위 통계 결과를 바탕으로 다음을 작성해줘:
+1. 각 군집의 특성을 성과(performance) 관점에서 해석해줘.
+2. ANOVA와 사후검증 결과를 바탕으로 집단 간 성과 차이가 통계적으로 유의미한지 설명해줘.
+3. 성과가 낮은 집단이 있다면, 그들의 다른 변수(stress, leadership 등) 특징을 찾아 원인을 분석하고 인사 전략을 제안해줘.
+"""
+
+# 7. Google GenAI (Gemini 2.5 Flash) 호출
+API_KEY = "여기에_당신의_API_키를_입력하세요" 
+client = genai.Client(api_key=API_KEY)
+
+print("Gemini가 통계 결과를 분석 중입니다...")
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt_context
+)
+interpretation_text = response.text
+
+# 8. 결과 저장 (엑셀)
+with pd.ExcelWriter(output_path) as writer:
+    # 시트 1: 개별 데이터 및 군집 할당
+    data_analysis.to_excel(writer, sheet_name='Clustering_Data', index=False)
+    
+    # 시트 2: ANOVA 및 사후검증 결과
+    anova_df = pd.DataFrame({'Metric': ['F-statistic', 'p-value'], 'Value': [f_stat, p_val]})
+    anova_df.to_excel(writer, sheet_name='ANOVA_Result', index=False)
+    tukey_summary.to_excel(writer, sheet_name='Tukey_PostHoc', index=False)
+    
+    # 시트 3: 군집별 평균
+    cluster_means.to_excel(writer, sheet_name='Cluster_Means')
+    
+    # 시트 4: Gemini 해석
+    pd.DataFrame({'Interpretation': [interpretation_text]}).to_excel(writer, sheet_name='AI_Report', index=False)
+
+print(f"\n분석 및 해석이 완료되었습니다. 파일 경로: {output_path}")
+print("\n[Gemini 해석 요약]\n")
+print(interpretation_text)

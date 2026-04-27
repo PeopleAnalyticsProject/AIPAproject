@@ -1,0 +1,97 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
+from sklearn.preprocessing import StandardScaler
+from google import genai
+import os
+
+# 1. 파일 경로 설정
+file_path = r'C:\Users\user\Desktop\8_PAproject_8_2_grouping.xlsx'
+output_path = r'C:\Users\user\Desktop\Dendrogram_Analysis_Result.xlsx'
+plot_path = r'C:\Users\user\Desktop\Dendrogram_Plot.png'
+
+# 2. 데이터 불러오기 및 전처리
+try:
+    df = pd.read_excel(file_path)
+    features = ['age', 'tenure_years', 'goal_difficulty', 'performance', 
+                'engagement', 'stress', 'collaboration', 'leadership']
+    
+    # 분석 데이터 추출 및 결측치 제거
+    data_for_clustering = df[features].dropna()
+    
+    # 데이터 표준화 (거리 기반 분석이므로 필수)
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(data_for_clustering)
+except Exception as e:
+    print(f"데이터 로드 중 오류 발생: {e}")
+    exit()
+
+# 3. 계층적 군집 분석 (Ward's method 사용)
+# 연결 방식(linkage)은 군집 간의 거리를 계산하는 Ward 방식을 주로 사용합니다.
+linked = linkage(scaled_data, method='ward')
+
+# 4. 덴드로그램 시각화 및 저장
+plt.figure(figsize=(12, 7))
+dendrogram(linked,
+           orientation='top',
+           labels=data_for_clustering.index.astype(str).tolist(),
+           distance_sort='descending',
+           show_leaf_counts=True)
+plt.title('Hierarchical Clustering Dendrogram')
+plt.xlabel('Sample Index')
+plt.ylabel('Distance (Ward)')
+plt.savefig(plot_path)  # 그래프 파일로 저장
+print(f"덴드로그램 그래프가 저장되었습니다: {plot_path}")
+plt.show()
+
+# 5. 군집 할당 (예시로 3개 그룹으로 나눔)
+# 실제 데이터의 형태를 보고 덴드로그램의 cut-off 지점을 정해야 하지만, 
+# 해석을 위해 임의로 3개 군집으로 설정하여 통계량을 산출합니다.
+n_clusters = 3
+clusters = fcluster(linked, n_clusters, criterion='maxclust')
+data_for_clustering['Cluster'] = clusters
+
+# 군집별 평균 통계량 계산 (Gemini 전달용)
+cluster_summary = data_for_clustering.groupby('Cluster').mean()
+
+# 6. Google GenAI (Gemini)를 이용한 해석
+API_KEY = "여기에_당신의_API_키를_입력하세요" 
+client = genai.Client(api_key=API_KEY)
+
+prompt = f"""
+다음은 조직 구성원 데이터를 바탕으로 계층적 군집 분석을 수행한 결과입니다. 
+데이터는 표준화된 상태이며, 아래 표는 각 군집(Cluster)별 변수의 평균값입니다.
+
+[군집별 평균치 데이터]
+{cluster_summary.to_string()}
+
+위 데이터를 바탕으로:
+1. 각 군집(1, 2, 3번)의 특징을 한글로 요약해줘. (예: 1번 군집은 성과가 높고 스트레스가 적은 '고성과 안정형' 등)
+2. 덴드로그램 결과가 시사하는 바를 인사 관리(HR) 관점에서 해석해줘.
+3. 향후 각 군집별로 어떤 관리 전략이 필요할지 추천해줘.
+"""
+
+print("Gemini가 군집 분석 결과를 해석 중입니다...")
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt
+)
+
+interpretation_text = response.text
+print("\n[Gemini 해석 결과]\n")
+print(interpretation_text)
+
+# 7. 결과 저장 (엑셀)
+with pd.ExcelWriter(output_path) as writer:
+    # 1) 개별 샘플의 군집 할당 결과
+    data_for_clustering.to_excel(writer, sheet_name='Cluster_Assignment')
+    
+    # 2) 군집별 평균 요약
+    cluster_summary.to_excel(writer, sheet_name='Cluster_Summary')
+    
+    # 3) Gemini 해석 결과
+    interpretation_df = pd.DataFrame({'Gemini_Interpretation': [interpretation_text]})
+    interpretation_df.to_excel(writer, sheet_name='Interpretation', index=False)
+
+print(f"\n분석 결과 및 해석이 저장되었습니다: {output_path}")

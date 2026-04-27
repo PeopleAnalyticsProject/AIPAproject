@@ -1,0 +1,94 @@
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from google import genai
+import os
+
+# 1. 파일 경로 설정
+file_path = r'C:\Users\user\Desktop\8_PAproject_8_2_grouping.xlsx'
+output_path = r'C:\Users\user\Desktop\PCA_Analysis_Result.xlsx'
+
+# 2. 데이터 불러오기 및 변수 선택
+try:
+    df = pd.read_excel(file_path)
+    features = ['age', 'tenure_years', 'goal_difficulty', 'performance', 
+                'engagement', 'stress', 'collaboration', 'leadership']
+    
+    # 결측치가 있을 경우 제거하거나 평균으로 대체 (여기서는 제거 선택)
+    x = df[features].dropna()
+    
+    # 데이터 표준화 (PCA는 스케일에 민감하므로 필수)
+    x_scaled = StandardScaler().fit_transform(x)
+except Exception as e:
+    print(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    exit()
+
+# 3. 주성분 분석(PCA) 수행
+# 모든 변수를 설명할 수 있는 만큼의 주성분 생성 (최대 8개)
+pca = PCA()
+pca_result = pca.fit_transform(x_scaled)
+
+# 결과 데이터프레임 생성 (고유값, 분산 설명력 등)
+explained_variance = pca.explained_variance_ratio_
+loadings = pd.DataFrame(
+    pca.components_.T, 
+    columns=[f'PC{i+1}' for i in range(len(features))], 
+    index=features
+)
+
+# 4. 분석 결과 요약 (Gemini 전달용)
+pca_summary = f"""
+[주성분 분석 결과 요약]
+- 분석 변수: {', '.join(features)}
+- 각 주성분의 분산 설명비: {np.round(explained_variance, 4).tolist()}
+- 주성분 로딩량(Loadings):
+{loadings.to_string()}
+"""
+
+# 5. Google GenAI (Gemini)를 이용한 해석
+# API 키를 직접 입력하세요.
+API_KEY = "여기에_당신의_API_키를_입력하세요" 
+
+client = genai.Client(api_key=API_KEY)
+
+prompt = f"""
+다음은 조직 구성원의 데이터를 바탕으로 수행한 주성분 분석(PCA) 결과입니다. 
+이 결과를 바탕으로 각 주성분(PC1, PC2 등)이 어떤 의미를 갖는지 해석해주고, 
+인사 관리(HR) 측면에서 어떤 시사점을 주는지 한국어로 요약해줘.
+
+{pca_summary}
+"""
+
+print("Gemini가 분석 결과를 해석 중입니다...")
+response = client.models.generate_content(
+    model="gemini-2.5-flash",  # 요청하신 모델명 사용
+    contents=prompt
+)
+
+interpretation_text = response.text
+print("\n[Gemini 해석 결과]\n")
+print(interpretation_text)
+
+# 6. 결과 저장 (엑셀)
+with pd.ExcelWriter(output_path) as writer:
+    # 1) 주성분 점수 (원본 데이터와 결합 가능)
+    pca_df = pd.DataFrame(pca_result, columns=[f'PC{i+1}' for i in range(len(features))])
+    pca_df.to_excel(writer, sheet_name='PCA_Scores', index=False)
+    
+    # 2) 로딩량 (변수별 기여도)
+    loadings.to_excel(writer, sheet_name='Loadings')
+    
+    # 3) 설명 분산
+    variance_df = pd.DataFrame({
+        'PC': [f'PC{i+1}' for i in range(len(features))],
+        'Explained Variance': explained_variance,
+        'Cumulative Variance': np.cumsum(explained_variance)
+    })
+    variance_df.to_excel(writer, sheet_name='Variance_Summary', index=False)
+    
+    # 4) Gemini 해석 결과 저장
+    interpretation_df = pd.DataFrame({'Gemini_Interpretation': [interpretation_text]})
+    interpretation_df.to_excel(writer, sheet_name='Interpretation', index=False)
+
+print(f"\n모든 분석 결과가 다음 경로에 저장되었습니다: {output_path}")
