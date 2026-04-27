@@ -69,3 +69,10 @@ Project#7 AI기반 Social Network People Analytics프로젝트
 5. 관계망 예측 분석 – 머신러닝 이용
 <br> 실무질문 - 다음 분기에 누구와 누구가 협업할 가능성이 높은가?  어떤 직원이 네트워크 이탈 위험이 높은가?  
 	           브로커 부담이 높은 직원은 burnout risk가 높은가?
+
+Project#8 AI기반 인력운영·배치관리 People Analytics프로젝트
+1. 사적재적소의 인력배치 관련 사례 정리– Google/Naver API + AI Summary
+2. Grouping Step 1. 성과는 어떤 축으로 구성되는가? – 주성분분석 Principle Component Analysis
+3. Grouping Step 2. 직원은 몇 개 그룹으로 나뉘는가? 자연스러운 집단의 수는? – Dendrogram 
+4. Grouping Step 3. 나뉜 집단은 어떻게 명명 할 수 있는가? – K-means Clustering 
+5. Grouping Step 4. 나뉜 집단의 성과는 유의미한 차이가 있는가? – ANOVA
