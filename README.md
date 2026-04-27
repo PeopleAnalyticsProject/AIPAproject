@@ -173,7 +173,7 @@ project/
 
 ---
 
-# Project #4. AI 기반 보상·임금관리 People Analytics 프로젝트 II: 검증 및 예측
+# Project #4. AI 기반 보상·임금관리 People Analytics 프로젝트 II: 검증및예측
 
 ## 프로젝트 개요
 
