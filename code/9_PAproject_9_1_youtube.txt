@@ -1,0 +1,109 @@
+import re
+import time
+import google.generativeai as genai
+from youtube_transcript_api import YouTubeTranscriptApi
+from pathlib import Path
+
+# --- 설정 ---
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"  # 실제 API 키를 입력하세요
+MODEL_NAME = "gemini-2.5-flash"        # 빠르고 성능이 좋은 1.5 Flash 모델
+WIKI_DIR = Path(r"C:\Users\user\Desktop")  # 💡 바탕화면으로 경로 수정됨
+
+# Gemini API 초기화
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel(MODEL_NAME)
+
+def extract_youtube(url):
+    """사용님의 환경에서 검증된 자막 추출 로직 (수정 완료)"""
+    try:
+        video_id = re.search(r"(?:v=|youtu\.be/)([^&\n?#]+)", url)
+        if not video_id:
+            print("  ❌ 유튜브 URL 형식 오류")
+            return ""
+        
+        ytt_api = YouTubeTranscriptApi()
+        # languages=['ko', 'en']은 지원되는 언어 순서대로 가져옵니다.
+        fetched = ytt_api.fetch(video_id.group(1), languages=["ko", "en"])
+        
+        # 핵심 수정: t['text']가 아니라 사용님 원래 방식인 t.text를 사용해야 합니다.
+        return " ".join([t.text for t in fetched])
+    
+    except Exception as e:
+        print(f"  ❌ 자막 추출 실패: {e}")
+        return ""
+
+def compile_to_wiki_gemini(source_name, text, source_type="유튜브 영상"):
+    """Gemini API를 사용하여 위키 생성"""
+    prompt = f"""다음은 {source_type} 자료입니다.
+
+=== 자료 ===
+{text}
+=== 자료 끝 ===
+
+위 자료를 바탕으로 아래 형식의 wiki 페이지를 한국어로 작성하세요.
+
+# [핵심 개념 제목]
+
+## 정의
+(핵심 개념을 2-3문장으로 요약)
+
+## 주요 내용
+(중요한 내용을 bullet point로 정리)
+
+## 관련 개념
+(자료에서 언급된 관련 개념들을 [[개념명]] 형식으로 나열)
+
+## 출처
+- 자료명: {source_name}
+- 자료유형: {source_type}
+
+규칙:
+- 반드시 위 형식을 따를 것
+- 관련 개념은 반드시 [[개념명]] 형식으로 쓸 것
+- 자료에 없는 내용은 추가하지 말 것
+- 한국어로만 작성할 것"""
+
+    try:
+        # Gemini 호출
+        response = model.generate_content(prompt)
+        # response.text를 통해 생성된 결과물을 가져옵니다.
+        return response.text
+    except Exception as e:
+        print(f"  ❌ Gemini 생성 오류: {e}")
+        return ""
+
+def process_youtube(url):
+    print(f"\n처리 중: {url}")
+    
+    # 1. 자막 추출
+    print("  🎬 유튜브 자막 추출 중...")
+    text = extract_youtube(url)
+    
+    if not text:
+        print("  ⚠️ 추출된 자막이 없습니다.")
+        return
+
+    # 2. Gemini를 이용한 위키 생성
+    print("  🤖 Gemini wiki 페이지 생성 중...")
+    wiki_page = compile_to_wiki_gemini(url, text)
+    
+    if not wiki_page:
+        return
+
+    # 3. 파일 저장
+    # 파일명으로 쓸 수 없는 문자 제거 및 고유 ID 생성
+    video_id_clean = re.sub(r'[<>:"/\\|?*]', '_', url.split("v=")[-1][:10])
+    
+    # 💡 "외부자료" 폴더를 거치지 않고 바탕화면에 바로 저장되도록 수정됨
+    out_file = WIKI_DIR / f"yt_{video_id_clean}.md"
+    
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(wiki_page, encoding="utf-8")
+    
+    print(f"  ✅ 저장 완료: 바탕화면의 {out_file.name}")
+
+if __name__ == "__main__":
+    # 실행부
+    target_url = input("📥 유튜브 URL 입력: ").strip()
+    if target_url:
+        process_youtube(target_url)

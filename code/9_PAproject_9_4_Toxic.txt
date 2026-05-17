@@ -1,0 +1,203 @@
+"""
+한국어 기업 리뷰 독성 탐지
+- 데이터:  C:/Users/user/Desktop/9_PAproject_9_4_sentiment.csv (변수명: review)
+- 모델:    beomi/korean-hatespeech-classifier
+
+설치:
+    pip install transformers torch pandas
+"""
+
+import re
+from collections import Counter
+
+import pandas as pd
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+
+
+# ─────────────────────────────────────────
+# 1. 설정
+# ─────────────────────────────────────────
+CSV_PATH    = r"C:\Users\user\Desktop\9_PAproject_9_4_sentiment.csv"
+OUTPUT_PATH = r"C:\Users\user\Desktop\9_toxicity_results.csv"
+MODEL_NAME  = "beomi/korean-hatespeech-classifier"
+
+
+# ─────────────────────────────────────────
+# 2. 데이터 로드
+# ─────────────────────────────────────────
+print("=" * 60)
+print("▶ Step 1: 데이터 로드")
+print("=" * 60)
+
+df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
+reviews_raw = df["review"].dropna().astype(str).tolist()
+print(f"  총 리뷰 수: {len(reviews_raw)}개")
+
+
+# ─────────────────────────────────────────
+# 3. 텍스트 정제
+# ─────────────────────────────────────────
+def clean_text(text: str) -> str:
+    text = re.sub(r"[^가-힣 ]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+reviews_clean = [clean_text(r) for r in reviews_raw]
+
+
+# ─────────────────────────────────────────
+# 4. 모델 로드
+# ─────────────────────────────────────────
+print("\n▶ Step 2: 모델 로드 중...")
+print("  (최초 실행 시 다운로드로 시간이 걸릴 수 있습니다)")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model     = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+
+classifier = pipeline(
+    "text-classification",
+    model=model,
+    tokenizer=tokenizer,
+    top_k=None,
+    truncation=True,
+    max_length=512,
+)
+
+# 모델의 실제 레이블 자동 감지
+actual_labels = list(model.config.id2label.values())
+print(f"  모델 로드 완료")
+print(f"  실제 레이블: {actual_labels}\n")
+
+
+# ─────────────────────────────────────────
+# 5. 레이블 매핑 (레이블명에 관계없이 자동 대응)
+# ─────────────────────────────────────────
+def map_label_ko(label: str) -> str:
+    """레이블을 한국어로 변환"""
+    l = label.lower()
+    if any(x in l for x in ["none", "normal", "clean", "0"]):
+        return "정상"
+    elif any(x in l for x in ["offensive", "1"]):
+        return "공격적"
+    elif any(x in l for x in ["hate", "2"]):
+        return "혐오"
+    return label
+
+def map_emoji(label: str) -> str:
+    return {"정상": "✅", "공격적": "⚠️", "혐오": "🚨"}.get(map_label_ko(label), "❓")
+
+def is_toxic(label: str) -> bool:
+    return map_label_ko(label) in ("공격적", "혐오")
+
+LABEL_KO    = {l: map_label_ko(l) for l in actual_labels}
+LABEL_EMOJI = {l: map_emoji(l)    for l in actual_labels}
+
+
+# ─────────────────────────────────────────
+# 6. 독성 탐지 함수
+# ─────────────────────────────────────────
+def detect_toxicity(text: str) -> dict:
+    """텍스트의 독성을 분석합니다."""
+    if not text.strip():
+        return {
+            "label":    actual_labels[0],
+            "label_ko": "정상",
+            "score":    1.0,
+            "is_toxic": False,
+            "scores":   {l: 0.0 for l in actual_labels},
+        }
+
+    raw       = classifier(text)
+    results   = raw[0] if isinstance(raw[0], list) else raw
+    scores    = {r["label"]: round(r["score"], 4) for r in results}
+    top_label = max(scores, key=scores.get)
+
+    return {
+        "label":    top_label,
+        "label_ko": LABEL_KO.get(top_label, top_label),
+        "score":    scores[top_label],
+        "is_toxic": is_toxic(top_label),
+        "scores":   scores,
+    }
+
+
+# ─────────────────────────────────────────
+# 7. 전체 리뷰 독성 탐지
+# ─────────────────────────────────────────
+print("=" * 60)
+print("▶ Step 3: 독성 탐지 중...")
+print("=" * 60)
+
+toxicity_results = [detect_toxicity(r) for r in reviews_clean]
+
+# 결과 샘플 출력 (처음 5개)
+print("\n  [탐지 결과 샘플 - 처음 5개]")
+for orig, res in zip(reviews_raw[:5], toxicity_results[:5]):
+    emoji = LABEL_EMOJI.get(res["label"], "")
+    score_str = " | ".join(
+        f"{LABEL_KO.get(k, k)}={v:.2%}"
+        for k, v in sorted(res["scores"].items(), key=lambda x: -x[1])
+    )
+    print(f"\n  {emoji} [{res['label_ko']}] (점수: {res['score']:.2%})")
+    print(f"     리뷰: {orig[:50]}")
+    print(f"     상세: {score_str}")
+
+
+# ─────────────────────────────────────────
+# 8. 독성 리뷰 필터링 출력
+# ─────────────────────────────────────────
+print("\n" + "=" * 60)
+print("▶ 독성 리뷰 목록")
+print("=" * 60)
+
+toxic_list = [
+    (orig, res)
+    for orig, res in zip(reviews_raw, toxicity_results)
+    if res["is_toxic"]
+]
+print(f"\n  전체 {len(reviews_raw)}개 중 독성 리뷰 {len(toxic_list)}개 감지\n")
+
+for orig, res in toxic_list:
+    emoji = LABEL_EMOJI.get(res["label"], "")
+    print(f"  {emoji} [{res['label_ko']}] (점수: {res['score']:.2%})")
+    print(f"     {orig[:60]}")
+
+
+# ─────────────────────────────────────────
+# 9. 독성 분포 통계
+# ─────────────────────────────────────────
+print("\n" + "=" * 60)
+print("▶ 독성 분포 요약")
+print("=" * 60)
+
+label_counts = Counter(r["label_ko"] for r in toxicity_results)
+total        = len(toxicity_results)
+
+for label_ko, count in label_counts.most_common():
+    pct   = count / total * 100
+    bar   = "█" * int(pct / 5)
+    emoji = {"정상": "✅", "공격적": "⚠️", "혐오": "🚨"}.get(label_ko, "❓")
+    print(f"  {emoji} {label_ko:5s} {bar:20s} {count}건 ({pct:.1f}%)")
+
+
+# ─────────────────────────────────────────
+# 10. 결과 저장
+# ─────────────────────────────────────────
+print("\n" + "=" * 60)
+print("▶ 결과 저장")
+print("=" * 60)
+
+output_df              = df.copy()
+output_df["독성레이블"] = [r["label_ko"]          for r in toxicity_results]
+output_df["독성점수"]   = [round(r["score"], 4)    for r in toxicity_results]
+output_df["독성여부"]   = [r["is_toxic"]           for r in toxicity_results]
+
+# 레이블별 점수 컬럼 동적 추가
+for label in actual_labels:
+    col_name = f"{LABEL_KO.get(label, label)}_점수"
+    output_df[col_name] = [r["scores"].get(label, 0) for r in toxicity_results]
+
+output_df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+print(f"  → {OUTPUT_PATH} 저장 완료")
+print(f"  → 총 {len(output_df)}행")
+print("\n✅ 완료!")

@@ -1,0 +1,177 @@
+"""
+한국어 기업 리뷰 감정 분류
+- 데이터:  C:/Users/user/Desktop/9_PAproject_9_4_sentiment.csv (변수명: review)
+- 모델:    Jinuuuu/KoELECTRA_fine_tunning_emotion
+- 레이블:  분노 / 행복 / 불안 / 당황 / 슬픔 / 상처 (6가지)
+
+설치:
+    pip install sentence-transformers transformers torch pandas
+"""
+
+import re
+from collections import Counter
+
+import pandas as pd
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+
+
+# ─────────────────────────────────────────
+# 1. 데이터 로드
+# ─────────────────────────────────────────
+print("=" * 60)
+print("▶ Step 1: 데이터 로드")
+print("=" * 60)
+
+CSV_PATH = r"C:\Users\user\Desktop\9_PAproject_9_4_sentiment.csv"
+
+df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
+reviews_raw = df["review"].dropna().astype(str).tolist()
+print(f"  총 리뷰 수: {len(reviews_raw)}개")
+
+
+# ─────────────────────────────────────────
+# 2. 텍스트 정제
+# ─────────────────────────────────────────
+def clean_text(text: str) -> str:
+    """특수문자 제거, 한글·공백만 유지"""
+    text = re.sub(r"[^가-힣 ]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+print("\n▶ Step 2: 텍스트 정제 중...")
+reviews_clean = [clean_text(r) for r in reviews_raw]
+
+print("\n  [정제 샘플]")
+for orig, clean in zip(reviews_raw[:3], reviews_clean[:3]):
+    print(f"  원문  : {orig[:50]}")
+    print(f"  정제후: {clean[:50]}")
+    print()
+
+
+# ─────────────────────────────────────────
+# 3. 감정 분류 모델 로드
+# ─────────────────────────────────────────
+print("▶ Step 3: 모델 로드 중...")
+print("  (최초 실행 시 모델 다운로드로 시간이 걸릴 수 있습니다)")
+
+MODEL_NAME = "Jinuuuu/KoELECTRA_fine_tunning_emotion"
+
+tokenizer  = AutoTokenizer.from_pretrained(MODEL_NAME)
+model      = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+
+classifier = pipeline(
+    "text-classification",
+    model=model,
+    tokenizer=tokenizer,
+    top_k=None,       # 6개 감정 전체 점수 반환
+    truncation=True,
+    max_length=512,
+)
+print("  모델 로드 완료\n")
+
+# 6가지 감정 레이블
+LABEL_KO = {
+    "anger":   "분노",
+    "happy":   "행복",
+    "anxiety": "불안",
+    "embarrass": "당황",
+    "sadness": "슬픔",
+    "wound":   "상처",
+}
+LABEL_EMOJI = {
+    "anger":     "😡",
+    "happy":     "😊",
+    "anxiety":   "😰",
+    "embarrass": "😳",
+    "sadness":   "😢",
+    "wound":     "🥺",
+}
+
+
+# ─────────────────────────────────────────
+# 4. 감정 분류 함수
+# ─────────────────────────────────────────
+def classify_emotion(text: str) -> dict:
+    """텍스트의 감정을 6가지로 분류합니다."""
+    if not text.strip():
+        return {
+            "label":    "sadness",
+            "label_ko": "슬픔",
+            "score":    1.0,
+            "scores":   {k: 0.0 for k in LABEL_KO},
+        }
+
+    raw     = classifier(text)
+    results = raw[0] if isinstance(raw[0], list) else raw
+    scores  = {r["label"]: round(r["score"], 4) for r in results}
+    top_label = max(scores, key=scores.get)
+
+    return {
+        "label":    top_label,
+        "label_ko": LABEL_KO.get(top_label, top_label),
+        "score":    scores[top_label],
+        "scores":   scores,
+    }
+
+
+# ─────────────────────────────────────────
+# 5. 전체 리뷰 감정 분류
+# ─────────────────────────────────────────
+print("=" * 60)
+print("▶ Step 4: 감정 분류 중...")
+print("=" * 60)
+
+emotion_results = [classify_emotion(r) for r in reviews_clean]
+
+# 결과 샘플 출력 (처음 5개)
+print("\n  [분류 결과 샘플 - 처음 5개]")
+for orig, res in zip(reviews_raw[:5], emotion_results[:5]):
+    emoji = LABEL_EMOJI.get(res["label"], "")
+    print(f"\n  {emoji} [{res['label_ko']}] (점수: {res['score']:.2%})")
+    print(f"     원문: {orig[:50]}")
+    # 6개 감정 점수 전체 출력
+    score_str = " | ".join(
+        f"{LABEL_KO.get(k, k)}={v:.2%}"
+        for k, v in sorted(res["scores"].items(), key=lambda x: -x[1])
+    )
+    print(f"     상세: {score_str}")
+
+
+# ─────────────────────────────────────────
+# 6. 감정 분포 통계
+# ─────────────────────────────────────────
+print("\n" + "=" * 60)
+print("▶ 감정 분포 요약")
+print("=" * 60)
+
+label_counts = Counter(r["label_ko"] for r in emotion_results)
+total = len(emotion_results)
+
+for label, count in label_counts.most_common():
+    pct = count / total * 100
+    bar = "█" * int(pct / 5)
+    print(f"  {label:5s} {bar:20s} {count}건 ({pct:.1f}%)")
+
+
+# ─────────────────────────────────────────
+# 7. 결과 저장
+# ─────────────────────────────────────────
+print("\n" + "=" * 60)
+print("▶ 결과 저장")
+print("=" * 60)
+
+output_df = df.copy()
+output_df["감정"]      = [r["label_ko"]              for r in emotion_results]
+output_df["감정_점수"] = [round(r["score"], 4)        for r in emotion_results]
+output_df["분노_점수"] = [r["scores"].get("anger",     0) for r in emotion_results]
+output_df["행복_점수"] = [r["scores"].get("happy",     0) for r in emotion_results]
+output_df["불안_점수"] = [r["scores"].get("anxiety",   0) for r in emotion_results]
+output_df["당황_점수"] = [r["scores"].get("embarrass", 0) for r in emotion_results]
+output_df["슬픔_점수"] = [r["scores"].get("sadness",   0) for r in emotion_results]
+output_df["상처_점수"] = [r["scores"].get("wound",     0) for r in emotion_results]
+
+OUTPUT_PATH = r"C:\Users\user\Desktop\9_emotion_results.csv"
+output_df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+print(f"  → {OUTPUT_PATH} 저장 완료")
+print(f"  → 총 {len(output_df)}행")
+print("\n✅ 완료!")

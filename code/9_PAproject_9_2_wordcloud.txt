@@ -1,0 +1,56 @@
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+from pathlib import Path
+
+# --- 설정부 ---
+# 파일 경로 설정 (제공해주신 경로 사용)
+TEXT_FILE = r"C:\Users\user\Desktop\9_interview.txt"
+STOPWORDS_FILE = r"C:\Users\user\Desktop\9_stopwords.txt"
+
+# 윈도우용 한글 글꼴 설정 (맑은 고딕)
+FONT_PATH = "C:/Windows/Fonts/malgun.ttf" 
+
+def create_wordcloud():
+    # 1. 인터뷰 텍스트 파일 읽기
+    try:
+        text = Path(TEXT_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"❌ 파일을 찾을 수 없습니다: {TEXT_FILE}")
+        return
+
+    # 2. 불용어(Stopwords) 파일 읽기
+    try:
+        # 파일 내용을 읽어 줄바꿈이나 공백으로 나누어 세트(set)로 저장
+        stopwords_raw = Path(STOPWORDS_FILE).read_text(encoding="utf-8")
+        custom_stopwords = set(stopwords_raw.split())
+    except FileNotFoundError:
+        print(f"⚠️ 불용어 파일이 없어 필터링 없이 진행합니다: {STOPWORDS_FILE}")
+        custom_stopwords = set()
+
+    # 3. 워드클라우드 설정 및 생성
+    print("🎨 워드클라우드 생성 중...")
+    wc = WordCloud(
+        font_path=FONT_PATH,        # 한글 폰트 지정 필수
+        background_color="white",   # 배경색
+        width=800,
+        height=600,
+        max_words=100,              # 최대 단어 수
+        stopwords=custom_stopwords, # 불용어 적용
+        colormap="viridis"          # 색상 테마
+    )
+
+    # 텍스트로부터 워드클라우드 생성
+    cloud = wc.generate(text)
+
+    # 4. 화면에 출력
+    plt.figure(figsize=(10, 8))
+    plt.imshow(cloud, interpolation="bilinear")
+    plt.axis("off")  # 축 눈금 숨기기
+    plt.show()
+
+    # 5. 파일로 저장 (선택 사항)
+    # cloud.to_file(r"C:\Users\user\Desktop\wordcloud_result.png")
+    # print("✅ 결과가 바탕화면에 저장되었습니다.")
+
+if __name__ == "__main__":
+    create_wordcloud()

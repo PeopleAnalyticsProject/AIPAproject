@@ -1,0 +1,446 @@
+
+"""
+
+한국어 기업 리뷰 감정 분석 - Gemini 2.5 Flash
+
+- 데이터:  C:/Users/user/Desktop/9_PAproject_9_4_sentiment.csv (변수명: review)
+
+- SDK:     google-genai (최신 공식 SDK)
+
+- 모델:    gemini-2.5-flash
+
+
+
+설치:
+
+    pip install google-genai pandas
+
+
+
+API 키 발급:
+
+    https://aistudio.google.com/ 에서 'Get API key' 클릭
+
+"""
+
+
+
+import json
+
+import re
+
+import time
+
+from collections import Counter
+
+
+
+import pandas as pd
+
+from google import genai
+
+from google.genai import types
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 1. 설정
+
+# ─────────────────────────────────────────
+
+GEMINI_API_KEY = "API-key"
+
+CSV_PATH       = r"C:\Users\user\Desktop\9_PAproject_9_4_sentiment.csv"
+
+OUTPUT_PATH    = r"C:\Users\user\Desktop\9_gemini_emotion_results.csv"
+
+MODEL_NAME     = "gemini-2.5-flash"
+
+BATCH_SIZE     = 30
+
+
+
+LABEL_EMOJI = {
+
+    "분노": "😡", "행복": "😊", "불안": "😰",
+
+    "당황": "😳", "슬픔": "😢", "상처": "🥺", "중립": "😐",
+
+}
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 2. 클라이언트 초기화
+
+# ─────────────────────────────────────────
+
+print("=" * 60)
+
+print("▶ Step 1: Gemini 클라이언트 초기화")
+
+print("=" * 60)
+
+
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+print(f"  모델: {MODEL_NAME}")
+
+print("  클라이언트 초기화 완료\n")
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 3. 데이터 로드
+
+# ─────────────────────────────────────────
+
+print("▶ Step 2: 데이터 로드")
+
+print("=" * 60)
+
+
+
+df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
+
+reviews = df["review"].dropna().astype(str).tolist()
+
+print(f"  총 리뷰 수: {len(reviews)}개\n")
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 4. 프롬프트 생성
+
+# ─────────────────────────────────────────
+
+def build_prompt(batch: list) -> str:
+
+    reviews_text = "\n".join(
+
+        f"{i+1}. {review}" for i, review in enumerate(batch)
+
+    )
+
+    prompt = f"""당신은 한국어 직장/기업 리뷰 감정 분석 전문가입니다.
+
+아래 리뷰들을 읽고 각 리뷰의 주된 감정을 분류해주세요.
+
+
+
+감정 분류 기준:
+
+- 분노: 화남, 불만, 짜증, 억울함
+
+- 행복: 만족, 기쁨, 긍정적, 추천
+
+- 불안: 걱정, 두려움, 불확실, 스트레스
+
+- 당황: 어이없음, 황당함, 놀람(부정적)
+
+- 슬픔: 실망, 우울, 허탈함
+
+- 상처: 모욕감, 무시당함, 자존심 상함
+
+- 중립: 사실 서술, 특별한 감정 없음
+
+
+
+리뷰 목록:
+
+{reviews_text}
+
+
+
+아래 JSON 배열 형식으로만 응답하세요. 다른 설명이나 마크다운 없이 JSON만 출력하세요:
+
+[{{"번호": 1, "감정": "행복", "이유": "복지와 팀원에 대한 만족 표현"}}, {{"번호": 2, "감정": "분노", "이유": "야근과 낮은 급여에 대한 불만"}}]"""
+
+    return prompt.strip()
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 5. JSON 파싱 (다단계 시도)
+
+# ─────────────────────────────────────────
+
+def parse_response(response_text: str, batch_size: int) -> list:
+
+
+
+    # ── 디버그: 응답 원문 출력 ──
+
+    print("\n  [Gemini 응답 원문 (처음 300자)]")
+
+    print("  " + "-" * 50)
+
+    print(response_text[:300])
+
+    print("  " + "-" * 50)
+
+
+
+    # 1단계: 마크다운 코드블록 제거 후 바로 파싱
+
+    text = re.sub(r"```json\s*|```\s*", "", response_text).strip()
+
+    try:
+
+        result = json.loads(text)
+
+        print("  ✅ JSON 파싱 성공")
+
+        return result
+
+    except json.JSONDecodeError:
+
+        pass
+
+
+
+    # 2단계: 응답 안에서 JSON 배열 부분만 추출
+
+    match = re.search(r"\[.*?\]", text, re.DOTALL)
+
+    if match:
+
+        try:
+
+            result = json.loads(match.group())
+
+            print("  ✅ JSON 파싱 성공 (배열 추출)")
+
+            return result
+
+        except json.JSONDecodeError:
+
+            pass
+
+
+
+    # 3단계: 완전 실패 → 응답 전문 출력 후 중립 반환
+
+    print("  ❌ JSON 파싱 최종 실패 — 응답 전문:")
+
+    print(response_text)
+
+    return [{"번호": i+1, "감정": "중립", "이유": "파싱 오류"} for i in range(batch_size)]
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 6. 배치 분석 함수
+
+# ─────────────────────────────────────────
+
+def analyze_batch(batch: list) -> list:
+
+    prompt = build_prompt(batch)
+
+
+
+    try:
+
+        response = client.models.generate_content(
+
+            model=MODEL_NAME,
+
+            contents=prompt,
+
+            config=types.GenerateContentConfig(
+
+                temperature=0.1,
+
+                response_mime_type="application/json",  # JSON만 반환하도록 강제
+
+                max_output_tokens=4096,
+
+            ),
+
+        )
+
+        return parse_response(response.text, len(batch))
+
+
+
+    except Exception as e:
+
+        print(f"  ⚠️  API 오류: {e}")
+
+        return [{"번호": i+1, "감정": "중립", "이유": f"API 오류: {e}"} for i in range(len(batch))]
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 7. 전체 리뷰 배치 처리
+
+# ─────────────────────────────────────────
+
+print("▶ Step 3: Gemini 감정 분석 중...")
+
+print("=" * 60)
+
+
+
+all_results   = []
+
+total_batches = (len(reviews) + BATCH_SIZE - 1) // BATCH_SIZE
+
+
+
+for i in range(0, len(reviews), BATCH_SIZE):
+
+    batch     = reviews[i:i + BATCH_SIZE]
+
+    batch_num = i // BATCH_SIZE + 1
+
+
+
+    print(f"\n  배치 {batch_num}/{total_batches} 처리 중... ({len(batch)}개 리뷰)")
+
+    results = analyze_batch(batch)
+
+    all_results.extend(results)
+
+
+
+    if i + BATCH_SIZE < len(reviews):
+
+        time.sleep(2)
+
+
+
+all_results_sorted = sorted(all_results, key=lambda x: x.get("번호", 0))
+
+print(f"\n  총 {len(all_results_sorted)}개 리뷰 분석 완료")
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 8. 결과 샘플 출력
+
+# ─────────────────────────────────────────
+
+print("\n" + "=" * 60)
+
+print("▶ 분석 결과 샘플 (처음 5개)")
+
+print("=" * 60)
+
+
+
+for res in all_results_sorted[:5]:
+
+    idx         = res.get("번호", 0) - 1
+
+    review_text = reviews[idx] if 0 <= idx < len(reviews) else ""
+
+    emotion     = res.get("감정", "중립")
+
+    reason      = res.get("이유", "")
+
+    emoji       = LABEL_EMOJI.get(emotion, "")
+
+
+
+    print(f"\n  {emoji} [{emotion}]")
+
+    print(f"     리뷰  : {review_text[:50]}")
+
+    print(f"     이유  : {reason}")
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 9. 감정 분포 통계
+
+# ─────────────────────────────────────────
+
+print("\n" + "=" * 60)
+
+print("▶ 감정 분포 요약")
+
+print("=" * 60)
+
+
+
+emotions     = [r.get("감정", "중립") for r in all_results_sorted]
+
+label_counts = Counter(emotions)
+
+total        = len(emotions)
+
+
+
+for label, count in label_counts.most_common():
+
+    pct   = count / total * 100
+
+    bar   = "█" * int(pct / 5)
+
+    emoji = LABEL_EMOJI.get(label, "")
+
+    print(f"  {emoji} {label:5s} {bar:20s} {count}건 ({pct:.1f}%)")
+
+
+
+
+
+# ─────────────────────────────────────────
+
+# 10. 결과 저장
+
+# ─────────────────────────────────────────
+
+print("\n" + "=" * 60)
+
+print("▶ 결과 저장")
+
+print("=" * 60)
+
+
+
+output_df             = df.copy()
+
+output_df["감정"]     = [r.get("감정", "중립") for r in all_results_sorted]
+
+output_df["분석이유"] = [r.get("이유", "")     for r in all_results_sorted]
+
+
+
+output_df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+
+print(f"  → {OUTPUT_PATH} 저장 완료")
+
+print(f"  → 총 {len(output_df)}행")
+
+print("\n✅ 완료!")

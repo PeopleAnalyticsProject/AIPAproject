@@ -1,0 +1,59 @@
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+
+# 1. 데이터 로드
+file_path = r'C:\Users\user\Desktop\9_PAproject_9_5_detect.xlsx'
+
+# 각 시트에서 데이터 불러오기
+df_a = pd.read_excel(file_path, sheet_name='A')
+df_b = pd.read_excel(file_path, sheet_name='B')
+df_mixed = pd.read_excel(file_path, sheet_name='Mixed')
+
+# 2. 학습 데이터 준비
+# A의 글에는 라벨 0, B의 글에는 라벨 1 부여
+df_a['label'] = 'A'
+df_b['label'] = 'B'
+
+# 학습을 위해 데이터 합치기
+train_df = pd.concat([df_a[['text', 'label']], df_b[['text', 'label']]], axis=0).dropna()
+
+# 3. TF-IDF 벡터화
+# 한국어 특성을 고려하여 형태소 분석기를 쓰면 더 정확하지만, 
+# 우선 요청하신 표준 TF-IDF 방식을 적용합니다.
+tfidf = TfidfVectorizer(max_features=5000)
+X = tfidf.fit_transform(train_df['text'])
+y = train_df['label']
+
+# (선택) 모델 성능 검증을 위해 학습용/검증용 분리
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 4. 로지스틱 회귀 모델 생성 및 학습
+model = LogisticRegression()
+model.fit(X_train, y_train)
+
+# 검증 결과 출력
+y_pred_val = model.predict(X_val)
+print(f"검증 데이터 정확도: {accuracy_score(y_val, y_pred_val):.2%}")
+
+# 5. 익명글(Mixed 시트) 작성자 예측
+# Mixed 시트 데이터 정제 (결측치 제거)
+mixed_texts = df_mixed['text'].fillna("").astype(str)
+X_mixed = tfidf.transform(mixed_texts)
+
+# 예측 수행
+predictions = model.predict(X_mixed)
+probabilities = model.predict_proba(X_mixed)  # 각 클래스별 확률
+
+# 6. 결과 저장
+df_mixed['predicted_author'] = predictions
+df_mixed['probability_A'] = probabilities[:, 0]
+df_mixed['probability_B'] = probabilities[:, 1]
+
+output_path = r'C:\Users\user\Desktop\9_detect_results.xlsx'
+df_mixed.to_excel(output_path, index=False)
+
+print(f"\n분석 완료! 결과가 다음 경로에 저장되었습니다: {output_path}")
+print(df_mixed[['text', 'predicted_author']].head())

@@ -1,0 +1,76 @@
+import pandas as pd
+import re
+from soynlp.noun import LRNounExtractor_v2
+from bertopic import BERTopic
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import CountVectorizer
+
+# 1. 파일 경로 설정
+csv_path = r'C:\Users\user\Desktop\9_PAproject_9_3_review.csv'
+stopwords_path = r'C:\Users\user\Desktop\9_stopwords.txt'
+
+# 2. 데이터 및 불용어 로드
+df = pd.read_csv(csv_path)
+reviews = df['review'].astype(str).tolist()
+
+with open(stopwords_path, 'r', encoding='utf-8') as f:
+    stopwords = [line.strip() for line in f if line.strip()]
+
+# 3. soynlp를 이용한 명사 추출 (전처리)
+print("▶ Step 1: soynlp 명사 추출기 학습 및 단어 정제 중...")
+noun_extractor = LRNounExtractor_v2(verbose=False)
+nouns_dict = noun_extractor.train_extract(reviews)
+learned_nouns = set(nouns_dict.keys())
+
+def extract_nouns(text):
+    text = re.sub(r"[^가-힣 ]", " ", text) # 한글만 남김
+    words = text.split()
+    # 학습된 명사 중 불용어 제외, 2글자 이상 단어만 추출
+    return [w for w in words if w in learned_nouns and w not in stopwords and len(w) > 1]
+
+# 명사로 이루어진 문서 리스트 생성
+docs = [" ".join(extract_nouns(doc)) for doc in reviews]
+# 유효한 텍스트가 있는 인덱스만 필터링
+valid_indices = [i for i, doc in enumerate(docs) if doc.strip()]
+final_docs = [docs[i] for i in valid_indices]
+original_df_subset = df.iloc[valid_indices].copy()
+
+# 4. 모델 구성 (SBERT + BERTopic)
+print("▶ Step 2: 임베딩 모델 및 BERTopic 설정 중...")
+
+# 지정하신 한국어 최적화 모델 로드
+embedding_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+
+# 토픽 단어 추출 시 불용어를 한 번 더 거르기 위한 Vectorizer 설정
+vectorizer_model = CountVectorizer(stop_words=stopwords)
+
+# BERTopic 초기화 (토픽 수 k=5 설정)
+topic_model = BERTopic(
+    embedding_model=embedding_model,
+    vectorizer_model=vectorizer_model,
+    nr_topics=5,            # 토픽 수를 5개로 강제 지정
+    calculate_probabilities=True,
+    verbose=True
+)
+
+# 5. 토픽 모델링 수행
+print("▶ Step 3: BERTopic 분석 실행 중...")
+topics, probs = topic_model.fit_transform(final_docs)
+
+# 6. 결과 요약 및 저장
+print("\n" + "="*50)
+print("BERTopic 분석 결과 요약")
+print("="*50)
+topic_info = topic_model.get_topic_info()
+print(topic_info[['Topic', 'Count', 'Name']].head())
+
+# 7. 상세 결과 CSV 저장
+# 원본 데이터에 토픽 번호와 대표 단어 결합
+original_df_subset['Topic'] = topics
+topic_names = topic_model.get_topic_info()[['Topic', 'Representation']]
+result_df = pd.merge(original_df_subset, topic_names, on='Topic', how='left')
+
+output_path = r'C:\Users\user\Desktop\BERTopic_9_3_Result.csv'
+result_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+
+print(f"\n✅ 완료! 상세 결과가 '{output_path}'에 저장되었습니다.")
