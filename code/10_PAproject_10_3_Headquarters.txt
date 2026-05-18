@@ -1,0 +1,272 @@
+import pandas as pd
+import requests
+import googlemaps
+import datetime
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# =====================================================================
+# 1. 환경 설정 및 API 키 입력
+# =====================================================================
+FILE_PATH = r"C:\Users\user\Desktop\10_PAproject_10_3_Address.xlsx"
+OUTPUT_PATH = r"C:\Users\user\Desktop\10_PAproject_10_3_Relocation_Result.xlsx"
+
+# 이전 후보지 목록
+CANDIDATES = {
+    "후보1_강남": "서울특별시 강남구 테헤란로 231",
+    "후보2_종로": "서울특별시 종로구 세종대로 209",
+    "후보3_용산": "서울특별시 용산구 원효로 216"
+}
+
+# [필수] 발급받은 API 인증 정보를 입력하세요.
+NAVER_CLIENT_ID = "YOUR_NAVER_CLIENT_ID"
+NAVER_CLIENT_SECRET = "YOUR_NAVER_CLIENT_SECRET"
+GOOGLE_API_KEY = "YOUR_GOOGLE_MAPS_API_KEY"
+
+# 네이버 API 헤더 설정
+naver_headers = {
+    "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+    "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET
+}
+
+# 구글 맵 클라이언트 초기화
+gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
+
+
+# =====================================================================
+# 2. 미래의 출퇴근 목표 시간 설정 (교통 예측용)
+# =====================================================================
+# 구글/네이버 교통 예측을 위해 다가오는 평일 기준 07:30, 18:30으로 설정합니다.
+target_date = datetime.date.today() + datetime.timedelta(days=1)
+if target_date.weekday() == 5:    # 토요일이면 월요일로
+    target_date += datetime.timedelta(days=2)
+elif target_date.weekday() == 6:  # 일요일이면 월요일로
+    target_date += datetime.timedelta(days=1)
+
+dt_am = datetime.datetime.combine(target_date, datetime.time(7, 30))
+dt_pm = datetime.datetime.combine(target_date, datetime.time(18, 30))
+
+naver_time_am = dt_am.strftime("%Y-%m-%dT%H:%M:%S")
+naver_time_pm = dt_pm.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# =====================================================================
+# 3. API 관련 핵심 함수 정의
+# =====================================================================
+
+# [네이버] 주소 -> 위경도 좌표 변환 ("경도,위도" 문자열 반환)
+def get_naver_coordinates(address):
+    url = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
+    params = {"query": address}
+    try:
+        response = requests.get(url, headers=naver_headers, params=params)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("addresses"):
+                lon = res_json["addresses"][0]["x"]
+                lat = res_json["addresses"][0]["y"]
+                return f"{lon},{lat}"
+    except Exception as e:
+        print(f"[네이버 지오코딩 에러] {e} - 주소: {address}")
+    return None
+
+# [네이버] 자차(Driving) 소요 시간 계산 (단위: 분)
+def get_naver_driving_time(start_coord, end_coord, departure_time):
+    url = "https://maps.apigw.ntruss.com/map-direction/v1/driving"
+    params = {
+        "start": start_coord,
+        "goal": end_coord,
+        "departure-time": departure_time
+    }
+    try:
+        response = requests.get(url, headers=naver_headers, params=params)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("route") and res_json["route"].get("traoptimal"):
+                duration_ms = res_json["route"]["traoptimal"][0]["summary"]["duration"]
+                return round(duration_ms / 1000 / 60, 1)
+    except Exception as e:
+        print(f"[네이버 경로 에러] {e}")
+    return None
+
+# [구글] 대중교통(Transit) 소요 시간 계산 (단위: 분)
+def get_google_transit_time(origin, destination, departure_time):
+    try:
+        directions_result = gmaps.directions(
+            origin, destination, mode="transit", departure_time=departure_time, language="ko"
+        )
+        if directions_result:
+            duration_seconds = directions_result[0]['legs'][0]['duration']['value']
+            return round(duration_seconds / 60, 1)
+    except Exception as e:
+        print(f"[구글 경로 에러] {e} - 출발지: {origin}")
+    return None
+
+
+# =====================================================================
+# 4. 메인 분석 및 계산 로직
+# =====================================================================
+
+print("1. HR 데이터 로드 및 필터링...")
+df = pd.read_excel(FILE_PATH)
+df_target = df[df['gtw'].isin(['driving', 'transit'])].copy()
+
+if df_target.empty:
+    print("[오류] 분석 대상 직원(driving 또는 transit)이 없습니다.")
+else:
+    print(f"총 {len(df_target)}명의 직원을 대상으로 분석을 시작합니다.")
+    
+    # 후보지 3곳의 네이버 좌표 미리 획득 (자차 전용)
+    candidate_naver_coords = {}
+    for name, addr in CANDIDATES.items():
+        candidate_naver_coords[name] = get_naver_coordinates(addr)
+
+    # 결과를 담을 딕셔너리 초기화
+    results_data = {col: [] for col in df_target.columns}
+    for name in CANDIDATES.keys():
+        results_data[f"{name}_출근"] = []
+        results_data[f"{name}_퇴근"] = []
+        results_data[f"{name}_왕복"] = []
+
+    # 직원별 반복 계산
+    print("2. 후보지별 출퇴근 소요 시간 계산 중 (API 호출)...")
+    for idx, row in df_target.iterrows():
+        home_address = row['address']
+        gtw_mode = row['gtw']
+        
+        # 기존 데이터 복사
+        for col in df_target.columns:
+            results_data[col].append(row[col])
+            
+        # 3개의 후보지에 대해 각각 계산
+        for name, cand_address in CANDIDATES.items():
+            am_time, pm_time, total_time = None, None, None
+            
+            if gtw_mode == 'driving':
+                home_coord = get_naver_coordinates(home_address)
+                cand_coord = candidate_naver_coords[name]
+                if home_coord and cand_coord:
+                    am_time = get_naver_driving_time(home_coord, cand_coord, naver_time_am)
+                    pm_time = get_naver_driving_time(cand_coord, home_coord, naver_time_pm)
+            
+            elif gtw_mode == 'transit':
+                am_time = get_google_transit_time(home_address, cand_address, dt_am)
+                pm_time = get_google_transit_time(cand_address, home_address, dt_pm)
+                
+            if am_time is not None and pm_time is not None:
+                total_time = round(am_time + pm_time, 1)
+                
+            results_data[f"{name}_출근"].append(am_time)
+            results_data[f"{name}_퇴근"].append(pm_time)
+            results_data[f"{name}_왕복"].append(total_time)
+
+    # 데이터프레임으로 변환
+    df_result = pd.DataFrame(results_data)
+    
+    # 3. 후보지별 총합 계산 및 최적지 판별
+    print("\n==================================================")
+    print("📊 [분석 결과] 직원 출퇴근 시간 총합 (왕복 기준)")
+    print("==================================================")
+    
+    min_sum = float('inf')
+    best_candidate = ""
+    summary_sums = {}
+    
+    for name in CANDIDATES.keys():
+        total_sum = df_result[f"{name}_왕복"].sum()
+        summary_sums[name] = total_sum
+        print(f" * {name} 총 소요시간: {total_sum:,.1f} 분")
+        
+        if total_sum < min_sum:
+            min_sum = total_sum
+            best_candidate = name
+            
+    print("--------------------------------------------------")
+    print(f"🏆 최적의 이전 후보지: [{best_candidate}]")
+    print(f"👉 직원들의 총 출퇴근 시간이 가장 적은 곳입니다. (총 {min_sum:,.1f}분)")
+    print("==================================================\n")
+    
+    # =====================================================================
+    # 5. 시각적 스타일을 적용한 고급 엑셀 파일 저장
+    # =====================================================================
+    print("4. 결과를 엑셀 파일로 시각화 및 스타일링 적용 중...")
+    with pd.ExcelWriter(OUTPUT_PATH, engine='openpyxl') as writer:
+        df_result.to_excel(writer, sheet_name='이전후보지_분석결과', index=False)
+        
+        # 스타일링을 위한 워크시트 객체 접근
+        workbook = writer.book
+        worksheet = writer.sheets['이전후보지_분석결과']
+        
+        # 색상 및 폰트 정의
+        header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid") # 남색
+        cand1_fill = PatternFill(start_color="F2DCDB", end_color="F2DCDB", fill_type="solid")  # 연분홍
+        cand2_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")  # 연초록
+        cand3_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # 연노랑
+        
+        font_header = Font(name="맑은 고딕", size=11, bold=True, color="FFFFFF")
+        font_data = Font(name="맑은 고딕", size=10)
+        font_total = Font(name="맑은 고딕", size=11, bold=True, color="C00000")
+        
+        align_center = Alignment(horizontal="center", vertical="center")
+        align_right = Alignment(horizontal="right", vertical="center")
+        
+        thin_border = Border(
+            left=Side(style='thin', color='D9D9D9'),
+            right=Side(style='thin', color='D9D9D9'),
+            top=Side(style='thin', color='D9D9D9'),
+            bottom=Side(style='thin', color='D9D9D9')
+        )
+        
+        # 헤더 채우기 및 열 너비 조정
+        for col_idx, col_name in enumerate(df_result.columns, 1):
+            cell = worksheet.cell(row=1, column=col_idx)
+            cell.font = font_header
+            cell.alignment = align_center
+            
+            # 후보지별로 헤더 색상 구분 부여하여 가독성 증대
+            if "후보1" in col_name:
+                cell.fill = cand1_fill
+                cell.font = Font(name="맑은 고딕", size=11, bold=True, color="000000")
+            elif "후보2" in col_name:
+                cell.fill = cand2_fill
+                cell.font = Font(name="맑은 고딕", size=11, bold=True, color="000000")
+            elif "후보3" in col_name:
+                cell.fill = cand3_fill
+                cell.font = Font(name="맑은 고딕", size=11, bold=True, color="000000")
+            else:
+                cell.fill = header_fill
+                
+        # 데이터 행 서식 지정
+        for row in worksheet.iter_rows(min_row=2, max_row=len(df_result)+1):
+            for cell in row:
+                cell.font = font_data
+                cell.border = thin_border
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '#,##0.0'
+                    cell.alignment = align_right
+                else:
+                    cell.alignment = align_center
+                    
+        # 최하단에 '총합(SUM)' 행 추가
+        total_row_idx = len(df_result) + 2
+        worksheet.cell(row=total_row_idx, column=1, value="총합 (SUM)").font = font_total
+        worksheet.cell(row=total_row_idx, column=1).alignment = align_center
+        
+        for col_idx, col_name in enumerate(df_result.columns, 1):
+            if col_idx > 1:
+                cell = worksheet.cell(row=total_row_idx, column=col_idx)
+                if "출근" in col_name or "퇴근" in col_name or "왕복" in col_name:
+                    col_letter = get_column_letter(col_idx)
+                    cell.value = f"=SUM({col_letter}2:{col_letter}{total_row_idx-1})"
+                    cell.font = font_total
+                    cell.number_format = '#,##0.0'
+                    cell.alignment = align_right
+                    cell.border = Border(top=Side(style='thin', color='000000'), bottom=Side(style='double', color='000000'))
+
+        # 열 너비 자동 맞춤
+        for col in worksheet.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = get_column_letter(col[0].column)
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    print(f"5. 엑셀 리포트 저장 완료:\n{OUTPUT_PATH}")

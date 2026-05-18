@@ -1,0 +1,97 @@
+import os
+import pandas as pd
+from google import genai
+from google.genai import types
+
+# ==========================================
+# 1. 환경 설정 및 파일 경로 지정
+# ==========================================
+# 실제 발급받은 Google AI API 키를 입력하세요.
+API_KEY = "YOUR_GOOGLE_API_KEY_HERE"
+
+INTERVIEW_FILE_PATH = r"C:\Users\user\Desktop\10_interview.txt"
+VARIABLE_FILE_PATH = r"C:\Users\user\Desktop\10_PAproject_10_1_variables.xlsx"
+
+# ==========================================
+# 2. 데이터 로드 및 전처리
+# ==========================================
+print("데이터를 로드하는 중입니다...")
+
+# 2-1. 인터뷰 텍스트 파일 읽기
+try:
+    with open(INTERVIEW_FILE_PATH, 'r', encoding='utf-8') as f:
+        interview_text = f.read()
+except UnicodeDecodeError:
+    # 인코딩 에러 발생 시 cp949(EUC-KR)로 재시도
+    with open(INTERVIEW_FILE_PATH, 'r', encoding='cp949') as f:
+        interview_text = f.read()
+
+# 2-2. 연구 변수 엑셀 파일 읽기
+# 유저가 지정한 컬럼명: variables(변수명), name(한국어명), description(설명)
+df_vars = pd.read_excel(VARIABLE_FILE_PATH)
+
+# LLM이 인식하기 좋게 엑셀 데이터를 텍스트(마크다운 표 형태)로 변환
+variables_summary = ""
+for idx, row in df_vars.iterrows():
+    variables_summary += f"- **변수코드**: {row['variables']} | **변수명**: {row['name']}\n  * **설명**: {row['description']}\n\n"
+
+print("데이터 로드가 완료되었습니다. 프롬프트를 구성합니다.")
+
+# ==========================================
+# 3. 프롬프트 엔지니어링 (Prompt Construction)
+# ==========================================
+prompt_content = f"""
+당신은 조직행동론(OB), 인적자원관리(HRM), 조직이론 관점의 우수한 데이터 분석가입니다.
+제공된 [연구 변수 목록]과 [직원 인터뷰 텍스트]를 철저히 분석하여, 인터뷰 내용에 명확히 근거한 인과관계 매개 가설(X -> M -> Y)을 복수(최소 3개 이상) 도출해주세요.
+
+[연구 변수 목록]
+{variables_summary}
+
+[직원 인터뷰 텍스트]
+{interview_text}
+
+---
+
+[요구사항 및 출력 양식]
+각 가설은 반드시 아래 양식을 지켜서 작성해주세요. 텍스트에 근거가 없는 자의적인 가설은 제외해야 합니다.
+
+■ 가설 N
+1. 가설 명제: (예: X가 M을 통해 Y에 미치는 영향에 대한 가설 서술)
+2. 변수 매핑:
+   - 독립변수(X): [변수코드] 변수명 (이유 간략히)
+   - 매개변수(M): [변수코드] 변수명 (이유 간략히)
+   - 종속변수(Y): [변수코드] 변수명 (이유 간략히)
+3. 인터뷰 근거 및 논리적 배경:
+   - 인터뷰에서 이 인과관계를 지지하는 핵심 문장이나 맥락을 요약/인용하고, 조직행동론/HRM 측면에서 왜 이 매개 경로(X -> M -> Y)가 성립하는지 구체적으로 논리적 서술을 더해주세요.
+"""
+
+# ==========================================
+# 4. Gemini API 호출 및 결과 출력
+# ==========================================
+print("Gemini 2.5 Flash 모델에게 분석을 요청합니다...")
+
+try:
+    # google-genai 최신 라이브러리 구조에 맞춘 클라이언트 초기화
+    client = genai.Client(api_key=API_KEY)
+    
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt_content,
+        # 분석의 정교함을 높이기 위해 제어 파라미터 설정 (선택사항)
+        config=types.GenerateContentConfig(
+            temperature=0.3,  # 일관되고 분석적인 답변을 위해 낮게 설정
+        )
+    )
+    
+    print("\n" + "="*40)
+    print("■ 분석 결과 및 매개 가설 도출 결과 ■")
+    print("="*40)
+    print(response.text)
+    
+    # 결과를 텍스트 파일로 저장하고 싶다면 아래 주석을 해제하세요.
+    # with open(r"C:\Users\user\Desktop\hypothesis_result.txt", "w", encoding="utf-8") as out_f:
+    #     out_f.write(response.text)
+    # print("\n결과가 hypothesis_result.txt 파일로 저장되었습니다.")
+
+except Exception as e:
+    print(f"\n오류가 발생했습니다: {e}")

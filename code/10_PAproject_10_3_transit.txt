@@ -1,0 +1,108 @@
+import pandas as pd
+import googlemaps
+import datetime
+
+# 1. 파일 경로 및 회사 주소 설정
+file_path = r"C:\Users\user\Desktop\10_PAproject_10_3_Address.xlsx"
+output_path = r"C:\Users\user\Desktop\10_PAproject_10_3_TransitTime_Result.xlsx"
+COMPANY_ADDRESS = "서울특별시 종로구 청계천로 1"
+
+# 2. 구글 맵 API 클라이언트 설정
+# Google Cloud Console에서 발급받은 API 키를 입력하세요. (Directions API 활성화 필요)
+GOOGLE_API_KEY = "YOUR_GOOGLE_MAPS_API_KEY" 
+gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
+
+# 3. 출발/퇴근 시간 설정 (반드시 미래 시간이어야 함)
+# 현재 기준으로 다가오는 가장 가까운 평일(월~금)의 시간을 계산합니다.
+now = datetime.datetime.now()
+target_date = now
+
+# 만약 현재 시간이 오후 6시 30분 이후라면, 안전하게 다음 날로 설정
+if now.hour >= 18 or (now.hour == 18 and now.minute >= 30):
+    target_date += datetime.timedelta(days=1)
+
+# 주말(토:5, 일:6)인 경우 다음 주 월요일로 날짜 보정
+if target_date.weekday() == 5:   # 토요일
+    target_date += datetime.timedelta(days=2)
+elif target_date.weekday() == 6: # 일요일
+    target_date += datetime.timedelta(days=1)
+
+# 오전 7:30, 오후 18:30 datetime 객체 생성
+departure_time_am = target_date.replace(hour=7, minute=30, second=0, microsecond=0)
+departure_time_pm = target_date.replace(hour=18, minute=30, second=0, microsecond=0)
+
+# 4. 구글 Directions API를 이용한 대중교통 이동 시간 계산 함수
+def get_transit_time(origin, destination, departure_time):
+    try:
+        # mode='transit' 으로 대중교통 길찾기 요청
+        directions_result = gmaps.directions(
+            origin,
+            destination,
+            mode="transit",
+            departure_time=departure_time,
+            language="ko"
+        )
+        
+        if directions_result:
+            # 첫 번째 추천 경로의 소요 시간(초 단위) 추출 후 분 단위로 변환
+            duration_seconds = directions_result[0]['legs'][0]['duration']['value']
+            duration_minutes = round(duration_seconds / 60, 1)
+            return duration_minutes
+        else:
+            # 경로를 찾지 못한 경우
+            return None
+            
+    except Exception as e:
+        print(f"[API 호출 에러] {e} (출발지: {origin})")
+        return None
+
+# ==========================================
+# 메인 로직 시작
+# ==========================================
+
+print("1. 엑셀 데이터를 불러오는 중...")
+df = pd.read_excel(file_path)
+
+# gtw 변수가 'transit'인 직원만 필터링
+df_transit = df[df['gtw'] == 'transit'].copy()
+
+if df_transit.empty:
+    print("[알림] gtw 변수가 'transit'인 직원이 없습니다. 코드를 종료합니다.")
+else:
+    print(f"총 {len(df_transit)}명의 대중교통(transit) 이용 직원을 찾았습니다.")
+    print(f"출근 기준 시간: {departure_time_am}")
+    print(f"퇴근 기준 시간: {departure_time_pm}")
+    print("2. 구글 맵 API를 통해 대중교통 이동 시간을 계산합니다. (시간이 소요될 수 있습니다)")
+    
+    am_times = []
+    pm_times = []
+    total_times = []
+    
+    for idx, row in df_transit.iterrows():
+        home_address = row['address']
+        
+        # 출근: 집 -> 회사 (오전 7:30)
+        am_time = get_transit_time(home_address, COMPANY_ADDRESS, departure_time_am)
+        
+        # 퇴근: 회사 -> 집 (오후 6:30)
+        pm_time = get_transit_time(COMPANY_ADDRESS, home_address, departure_time_pm)
+        
+        # 결과 기록
+        if am_time is not None and pm_time is not None:
+            am_times.append(am_time)
+            pm_times.append(pm_time)
+            total_times.append(round(am_time + pm_time, 1))
+        else:
+            print(f"[경고] 경로를 찾을 수 없습니다. - 주소: {home_address}")
+            am_times.append(None)
+            pm_times.append(None)
+            total_times.append(None)
+            
+    # 3. 계산 결과를 데이터프레임에 추가
+    df_transit['출근시간_분'] = am_times
+    df_transit['퇴근시간_분'] = pm_times
+    df_transit['총출퇴근시간_분'] = total_times
+    
+    # 4. 결과를 별도의 엑셀 파일로 저장
+    df_transit.to_excel(output_path, index=False)
+    print(f"\n3. 계산 완료! 결과가 다음 경로에 저장되었습니다:\n{output_path}")

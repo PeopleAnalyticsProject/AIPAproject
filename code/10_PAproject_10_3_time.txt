@@ -1,0 +1,178 @@
+import pandas as pd
+import requests
+import googlemaps
+import datetime
+
+# =====================================================================
+# 1. 환경 설정 및 API 키 입력
+# =====================================================================
+FILE_PATH = r"C:\Users\user\Desktop\10_PAproject_10_3_Address.xlsx"
+OUTPUT_PATH = r"C:\Users\user\Desktop\10_PAproject_10_3_CommuteTime_Result.xlsx"
+COMPANY_ADDRESS = "서울특별시 종로구 청계천로 1"
+
+# [필수] 발급받은 API 인증 정보를 입력하세요.
+NAVER_CLIENT_ID = "YOUR_NAVER_CLIENT_ID"
+NAVER_CLIENT_SECRET = "YOUR_NAVER_CLIENT_SECRET"
+GOOGLE_API_KEY = "YOUR_GOOGLE_MAPS_API_KEY"
+
+# 네이버 API용 헤더 설정
+naver_headers = {
+    "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+    "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET
+}
+
+# 구글 맵 클라이언트 초기화
+gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
+
+
+# =====================================================================
+# 2. 미래의 출퇴근 목표 시간 설정 (교통 예측용)
+# =====================================================================
+# 항상 '미래'의 평일 시점을 잡기 위해, 내일(또는 다음 주 월요일)을 기준으로 설정합니다.
+target_date = datetime.date.today() + datetime.timedelta(days=1)
+
+# 주말(토:5, 일:6)일 경우 다음 주 월요일로 보정
+if target_date.weekday() == 5:
+    target_date += datetime.timedelta(days=2)
+elif target_date.weekday() == 6:
+    target_date += datetime.timedelta(days=1)
+
+# datetime 객체 생성 (오전 07:30, 오후 18:30)
+dt_am = datetime.datetime.combine(target_date, datetime.time(7, 30))
+dt_pm = datetime.datetime.combine(target_date, datetime.time(18, 30))
+
+# 네이버 API용 시간 포맷 (ISO 8601 문자열)
+naver_time_am = dt_am.strftime("%Y-%m-%dT%H:%M:%S")
+naver_time_pm = dt_pm.strftime("%Y-%m-%dT%H:%M:%S")
+
+# 구글 API용 시간 포맷 (datetime 객체 그대로 사용 가능)
+google_time_am = dt_am
+google_time_pm = dt_pm
+
+
+# =====================================================================
+# 3. 기능별 함수 정의
+# =====================================================================
+
+# [네이버] 주소 -> 위경도 좌표 변환 (Driving API는 "경도,위도" 포맷 문자열 필요)
+def get_naver_coordinates(address):
+    url = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
+    params = {"query": address}
+    try:
+        response = requests.get(url, headers=naver_headers, params=params)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("addresses"):
+                lon = res_json["addresses"][0]["x"]
+                lat = res_json["addresses"][0]["y"]
+                return f"{lon},{lat}"
+    except Exception as e:
+        print(f"[네이버 지오코딩 에러] {e} - 주소: {address}")
+    return None
+
+# [네이버] 자차(Driving) 소요 시간 계산 (단위: 분)
+def get_naver_driving_time(start_coord, end_coord, departure_time):
+    url = "https://maps.apigw.ntruss.com/map-direction/v1/driving"
+    params = {
+        "start": start_coord,
+        "goal": end_coord,
+        "departure-time": departure_time
+    }
+    try:
+        response = requests.get(url, headers=naver_headers, params=params)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("route") and res_json["route"].get("traoptimal"):
+                duration_ms = res_json["route"]["traoptimal"][0]["summary"]["duration"]
+                return round(duration_ms / 1000 / 60, 1)  # 밀리초 -> 분 변환
+    except Exception as e:
+        print(f"[네이버 경로 에러] {e}")
+    return None
+
+# [구글] 대중교통(Transit) 소요 시간 계산 (단위: 분)
+def get_google_transit_time(origin, destination, departure_time):
+    try:
+        directions_result = gmaps.directions(
+            origin,
+            destination,
+            mode="transit",
+            departure_time=departure_time,
+            language="ko"
+        )
+        if directions_result:
+            duration_seconds = directions_result[0]['legs'][0]['duration']['value']
+            return round(duration_seconds / 60, 1)  # 초 -> 분 변환
+    except Exception as e:
+        print(f"[구글 경로 에러] {e} - 출발지: {origin}")
+    return None
+
+
+# =====================================================================
+# 4. 메인 데이터 처리 로직
+# =====================================================================
+
+print("1. 엑셀 데이터를 불러오는 중...")
+df = pd.read_excel(FILE_PATH)
+
+# driving 이거나 transit 인 대상자만 필터링 (기타 도보/재택 등 제외)
+df_target = df[df['gtw'].isin(['driving', 'transit'])].copy()
+
+if df_target.empty:
+    print("[알림] 분석 대상(driving 또는 transit) 직원이 데이터에 없습니다.")
+else:
+    print(f"총 {len(df_target)}명의 대상 직원을 찾았습니다. (출퇴근 요일 기준: {target_date})")
+    
+    # 네이버 driving 처리를 위한 회사 주소 좌표 변환 (1회만 수행)
+    company_naver_coord = get_naver_coordinates(COMPANY_ADDRESS)
+    
+    am_times = []
+    pm_times = []
+    total_times = []
+    
+    print("2. 직원별 출퇴근 소요 시간 계산을 시작합니다...")
+    
+    for idx, row in df_target.iterrows():
+        home_address = row['address']
+        gtw_mode = row['gtw']
+        
+        am_time = None
+        pm_time = None
+        
+        # Case A: 자차 출퇴근 (네이버 API 활용)
+        if gtw_mode == 'driving':
+            if company_naver_coord:
+                home_naver_coord = get_naver_coordinates(home_address)
+                if home_naver_coord:
+                    # 출근: 집 -> 회사 (07:30)
+                    am_time = get_naver_driving_time(home_naver_coord, company_naver_coord, naver_time_am)
+                    # 퇴근: 회사 -> 집 (18:30)
+                    pm_time = get_naver_driving_time(company_naver_coord, home_naver_coord, naver_time_pm)
+            else:
+                print("[경고] 회사의 네이버 좌표를 찾을 수 없어 자차 계산을 건너뜁니다.")
+                
+        # Case B: 대중교통 출퇴근 (구글 API 활용)
+        elif gtw_mode == 'transit':
+            # 출근: 집 -> 회사 (07:30)
+            am_time = get_google_transit_time(home_address, COMPANY_ADDRESS, google_time_am)
+            # 퇴근: 회사 -> 집 (18:30)
+            pm_time = get_google_transit_time(COMPANY_ADDRESS, home_address, google_time_pm)
+            
+        # 결과 배열에 추가 및 합계 계산
+        if am_time is not None and pm_time is not None:
+            am_times.append(am_time)
+            pm_times.append(pm_time)
+            total_times.append(round(am_time + pm_time, 1))
+        else:
+            print(f"[주의] 경로 계산 실패 - 주소: {home_address} ({gtw_mode})")
+            am_times.append(None)
+            pm_times.append(None)
+            total_times.append(None)
+            
+    # 데이터프레임에 결과 열 추가
+    df_target['출근시간_분'] = am_times
+    df_target['퇴근시간_분'] = pm_times
+    df_target['총출퇴근시간_분'] = total_times
+    
+    # 5. 별도의 엑셀 파일로 결과 저장
+    df_target.to_excel(OUTPUT_PATH, index=False)
+    print(f"\n3. 계산 완료! 결과가 새 엑셀 파일로 저장되었습니다:\n{OUTPUT_PATH}")

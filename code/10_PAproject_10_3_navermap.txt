@@ -1,0 +1,106 @@
+import pandas as pd
+import requests
+import folium
+
+# 1. 파일 경로 설정 및 엑셀 데이터 불러오기
+file_path = r"C:\Users\user\Desktop\10_PAproject_10_3_Address.xlsx"
+df = pd.read_excel(file_path)
+
+# 2. 네이버 클라우드 플랫폼 API 인증 정보 입력
+# 네이버 클라우드 플랫폼 콘솔 -> AI·NAVER API -> Application 등록에서 발급받은 키를 입력하세요.
+CLIENT_ID = "YOUR_NAVER_CLIENT_ID"       # 여기에 발급받은 Client ID 입력
+CLIENT_SECRET = "YOUR_NAVER_CLIENT_SECRET" # 여기에 발급받은 Client Secret 입력
+
+headers = {
+    "X-NCP-APIGW-API-KEY-ID": CLIENT_ID,
+    "X-NCP-APIGW-API-KEY": CLIENT_SECRET
+}
+
+# 3. 네이버 지오코딩 API를 활용한 주소 -> 위경도 변환 함수
+def get_coordinates(address):
+    # 제공해주신 베이스 URL 뒤에 /geocode를 결합하여 요청합니다.
+    url = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
+    params = {"query": address}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("addresses"):
+                # x는 경도(Longitude), y는 위도(Latitude)입니다.
+                lon = float(res_json["addresses"][0]["x"])
+                lat = float(res_json["addresses"][0]["y"])
+                return lat, lon
+        else:
+            print(f"API 호출 실패 (상태코드: {response.status_code}) - 주소: {address}")
+    except Exception as e:
+        print(f"에러 발생: {e} - 주소: {address}")
+        
+    return None, None
+
+# 4. 데이터프레임의 모든 주소에 대해 위경도 좌표 검색 및 추가
+print("네이버 API를 통해 주소를 좌표로 변환하고 있습니다...")
+lats = []
+lons = []
+
+for addr in df['address']:
+    lat, lon = get_coordinates(addr)
+    lats.append(lat)
+    lons.append(lon)
+
+df['lat'] = lats
+df['lon'] = lons
+
+# 좌표 변환에 실패한 데이터(결측치)가 있다면 제외합니다.
+df_clean = df.dropna(subset=['lat', 'lon'])
+
+# 5. 사용자 지정 조건에 따른 마커 색상 결정 함수
+def select_marker_color(gender, children):
+    if gender == "여" and children == "유":
+        return "red"       # 1) gender "여" & children "유" -> 빨간색
+    elif gender == "여" and children == "무":
+        return "green"     # 2) gender "여" & children "무" -> 초록색
+    elif gender == "남" and children == "유":
+        return "blue"      # 3) gender "남" & children "유" -> 파란색
+    elif gender == "남" and children == "무":
+        return "purple"    # 4) gender "남" & children "무" -> 보라색
+    return "gray"          # 예외 상황 시 기본 회색 마커
+
+# 6. 지도 시각화 객체 생성 (직원들 주소의 평균 위치를 지도의 중심으로 설정)
+if not df_clean.empty:
+    center_lat = df_clean['lat'].mean()
+    center_lon = df_clean['lon'].mean()
+    
+    # 지도의 초기 중심점 및 줌 레벨 설정
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+    
+    # 7. 지도 위에 직원별 마커 추가
+    for idx, row in df_clean.iterrows():
+        color = select_marker_color(row['gender'], row['children'])
+        
+        # 마커 클릭 시 띄워줄 팝업 내용 구성 (HTML 서식 활용 가능)
+        popup_html = f"""
+        <div style="width:180px; font-size:12px;">
+            <b>성별:</b> {row['gender']}<br>
+            <b>나이:</b> {row['age']}세<br>
+            <b>근속연수:</b> {row['tenure']}년<br>
+            <b>자녀여부:</b> {row['children']}<br>
+            <hr style="margin:5px 0;">
+            <b>주소:</b> {row['address']}
+        </div>
+        """
+        popup = folium.Popup(popup_html, max_width=250)
+        
+        # 지도에 마커 표시
+        folium.Marker(
+            location=[row['lat'], row['lon']],
+            popup=popup,
+            icon=folium.Icon(color=color, icon='info-sign')
+        ).add_to(m)
+        
+    # 8. 바탕화면(Desktop)에 결과 HTML 파일로 저장
+    output_html_path = r"C:\Users\user\Desktop\10_PAproject_10_3_Map_Result.html"
+    m.save(output_html_path)
+    print(f"\n시각화 완료! 결과 파일이 저장되었습니다:\n{output_html_path}")
+else:
+    print("\n[오류] 변환에 성공한 좌표 데이터가 없어 지도를 생성할 수 없습니다. API 키나 주소 데이터를 확인해주세요.")

@@ -1,0 +1,185 @@
+import os
+import numpy as np
+import pandas as pd
+import semopy
+from google import genai
+from google.genai import types
+
+# ==========================================
+# 1. 환경 설정 및 파일 경로 지정
+# ==========================================
+# 발급받은 Google AI API 키를 입력하세요.
+API_KEY = "YOUR_GOOGLE_API_KEY_HERE"
+
+DATA_PATH = r"C:\Users\user\Desktop\10_PAproject_10_2_SEM.csv"
+
+# ==========================================
+# 2. 데이터 로드 및 SEM 모형 정의
+# ==========================================
+print("1. 데이터를 로드하고 구조방정식 모형을 설정합니다...")
+data = pd.read_csv(DATA_PATH)
+
+# semopy 문법에 맞게 측정 모형(Latent) 및 구조 모형(Structural) 정의
+# =~ : 측정 모형 (잠재변수 =~ 측정지표)
+# ~  : 구조 모형 (종속변수 ~ 독립변수)
+model_spec = """
+# 측정 모형 (Measurement Model)
+Fair =~ Fair1 + Fair2 + Fair3 + Fair4
+Burn =~ Burn1 + Burn2 + Burn3 + Burn4
+JS =~ JS1 + JS2 + JS3 + JS4
+POS =~ POS1 + POS2 + POS3 + POS4
+Perf =~ Perf1 + Perf2 + Perf3 + Perf4
+
+# 구조 모형 (Structural Model)
+JS ~ Fair + Burn
+POS ~ Fair + Burn
+Perf ~ JS + POS + Fair + Burn
+"""
+
+# ==========================================
+# 3. 기본 모형 분석 (Original Model Fit)
+# ==========================================
+print("2. 전체 데이터에 대한 구조방정식 분석을 모델링합니다...")
+model = semopy.Model(model_spec)
+model.fit(data)
+
+# 경로계수 결과 및 적합도 지수 추출
+estimates = model.inspect()
+stats = semopy.calc_stats(model)
+
+# LLM에 제공할 적합도 및 경로계수 텍스트 변환
+stats_str = stats.to_string()
+structural_paths = estimates[estimates['op'] == '~'].to_string()
+
+# ==========================================
+# 4. Bootstrapping을 통한 매개효과(간접효과) 검증
+# ==========================================
+# 가설 경로 정의:
+# H1: Fair -> JS -> Perf
+# H2: Burn -> JS -> Perf
+# H3: Fair -> POS -> Perf
+# H4: Burn -> POS -> Perf
+
+n_bootstraps = 500  # 정확성을 위해 실제 연구에서는 1000~5000회를 권장하나 속도를 위해 500회 설정
+boot_results = {'H1': [], 'H2': [], 'H3': [], 'H4': []}
+
+print(f"3. Bootstrapping({n_bootstraps}회)을 통해 매개효과 신뢰구간을 계산합니다. 잠시만 기다려주세요...")
+
+for i in range(n_bootstraps):
+    # 복원 추출로 부트스트랩 샘플 생성
+    boot_data = data.sample(n=len(data), replace=True)
+    try:
+        boot_model = semopy.Model(model_spec)
+        boot_model.fit(boot_data)
+        boot_est = boot_model.inspect()
+        
+        # 각 경로 계수 추출 (lval: 종속변수, rval: 독립변수, op: '~')
+        # JS 경로
+        p_Fair_JS = boot_est[(boot_est['lval']=='JS') & (boot_est['rval']=='Fair') & (boot_est['op']=='~')]['Estimate'].values[0]
+        p_Burn_JS = boot_est[(boot_est['lval']=='JS') & (boot_est['rval']=='Burn') & (boot_est['op']=='~')]['Estimate'].values[0]
+        
+        # POS 경로
+        p_Fair_POS = boot_est[(boot_est['lval']=='POS') & (boot_est['rval']=='Fair') & (boot_est['op']=='~')]['Estimate'].values[0]
+        p_Burn_POS = boot_est[(boot_est['lval']=='POS') & (boot_est['rval']=='Burn') & (boot_est['op']=='~')]['Estimate'].values[0]
+        
+        # Perf 경로
+        p_JS_Perf = boot_est[(boot_est['lval']=='Perf') & (boot_est['rval']=='JS') & (boot_est['op']=='~')]['Estimate'].values[0]
+        p_POS_Perf = boot_est[(boot_est['lval']=='Perf') & (boot_est['rval']=='POS') & (boot_est['op']=='~')]['Estimate'].values[0]
+        
+        # 간접효과 계산 ($a \times b$)
+        boot_results['H1'].append(p_Fair_JS * p_JS_Perf)
+        boot_results['H2'].append(p_Burn_JS * p_JS_Perf)
+        boot_results['H3'].append(p_Fair_POS * p_POS_Perf)
+        boot_results['H4'].append(p_Burn_POS * p_POS_Perf)
+    except Exception:
+        # 모델 수렴 실패 시 해당 회차는 건너뜀
+        continue
+
+# 원래 모델에서의 간접효과 점추정치 계산
+orig_Fair_JS = estimates[(estimates['lval']=='JS') & (estimates['rval']=='Fair') & (estimates['op']=='~')]['Estimate'].values[0]
+orig_Burn_JS = estimates[(estimates['lval']=='JS') & (estimates['rval']=='Burn') & (estimates['op']=='~')]['Estimate'].values[0]
+orig_Fair_POS = estimates[(estimates['lval']=='POS') & (estimates['rval']=='Fair') & (estimates['op']=='~')]['Estimate'].values[0]
+orig_Burn_POS = estimates[(estimates['lval']=='POS') & (estimates['rval']=='Burn') & (estimates['op']=='~')]['Estimate'].values[0]
+orig_JS_Perf = estimates[(estimates['lval']=='Perf') & (estimates['rval']=='JS') & (estimates['op']=='~')]['Estimate'].values[0]
+orig_POS_Perf = estimates[(estimates['lval']=='Perf') & (estimates['rval']=='POS') & (estimates['op']=='~')]['Estimate'].values[0]
+
+orig_indirect = {
+    'H1': orig_Fair_JS * orig_JS_Perf,
+    'H2': orig_Burn_JS * orig_JS_Perf,
+    'H3': orig_Fair_POS * orig_POS_Perf,
+    'H4': orig_Burn_POS * orig_POS_Perf
+}
+
+# Bootstrapping 결과 정리 (95% 신뢰구간 계산)
+mediation_summary = ""
+hypotheses_names = {
+    'H1': '가설 1 (공정성인식 -> 직무만족 -> 직무성과)',
+    'H2': '가설 2 (번아웃 -> 직무만족 -> 직무성과)',
+    'H3': '가설 3 (공정성인식 -> 조직지원인식 -> 직무성과)',
+    'H4': '가설 4 (번아웃 -> 조직지원인식 -> 직무성과)'
+}
+
+for key in ['H1', 'H2', 'H3', 'H4']:
+    arr = np.array(boot_results[key])
+    low_ci = np.percentile(arr, 2.5)   # 하위 2.5%
+    high_ci = np.percentile(arr, 97.5) # 상위 97.5%
+    est_val = orig_indirect[key]
+    
+    # 신뢰구간 안에 0이 포함되는지 여부로 유의성 판단
+    is_significant = "유의함 (0을 포함하지 않음)" if low_ci * high_ci > 0 else "유의하지 않음 (0을 포함함)"
+    
+    mediation_summary += f"- **{hypotheses_names[key]}**:\n"
+    mediation_summary += f"  * 간접효과 추정치(Point Estimate): {est_val:.4f}\n"
+    mediation_summary += f"  * Bootstrapping 95% 신뢰구간: [{low_ci:.4f}, {high_ci:.4f}]\n"
+    mediation_summary += f"  * 유의성 통계적 판정: {is_significant}\n\n"
+
+# ==========================================
+# 5. Prompt 구성 및 Gemini API 통신
+# ==========================================
+print("4. 분석 통계치를 취합하여 Gemini AI에게 전송합니다...")
+
+prompt_content = f"""
+당신은 구조방정식 모형(SEM) 분석 결과를 전문적으로 검토하고 해석하는 대학교수이자 인사조직 분야의 분석가입니다.
+제공된 구조방정식 분석 결과(모델 적합도 지수, 직접 경로 계수)와 Bootstrapping 기반 매개효과 검증 결과를 종합적으로 검토하여 심층 학술 분석 보고서를 작성해 주세요.
+
+[연구 모델 및 가설 개요]
+- 가설 1. 공정성인식(Fair) -> 직무만족(JS) -> 직무성과(Perf) (정의 관계 매개)
+- 가설 2. 번아웃(Burn) -> 직무만족(JS) -> 직무성과(Perf) (부의 관계 매개)
+- 가설 3. 공정성인식(Fair) -> 조직지원인식(POS) -> 직무성과(Perf) (정의 관계 매개)
+- 가설 4. 번아웃(Burn) -> 조직지원인식(POS) -> 직무성과(Perf) (부의 관계 매개)
+
+[1. 전체 모델 적합도 지수 (Model Fit Indices)]
+{stats_str}
+
+[2. 주요 직접 경로 계수 (Path Coefficients)]
+{structural_paths}
+
+[3. Bootstrapping 매개효과(간접효과) 분석 통계치]
+{mediation_summary}
+
+---
+[보고서 요구사항 및 구성 목차]
+1. 모형 적합도(Model Fit) 평가: 통상적인 학술적 기준(CFI/TLI 0.90 이상, RMSEA/SRMR 0.08 혹은 0.05 이하 등)과 비교하여 본 연구 모형이 데이터를 분석하기에 적합한 수준인지 구체적인 수치를 바탕으로 종합 기술해 주세요.
+2. 가설 검증 결과 및 해석: 가설 1부터 가설 4까지 하나씩 짚어가며, 직접 경로의 유의성(p-value)과 Bootstrapping 95% 신뢰구간(CI) 분석 결과를 매핑하여 채택 혹은 기각 여부를 최종 선언해 주세요. 매개 효과가 완전 매개(Full)인지 부분 매개(Partial)인지도 함께 판단해 주세요.
+3. 조직행동론 및 HRM 관점의 시사점: 분석 결과를 기반으로 구성원의 만족도, 조직지원인식 향상 및 번아웃 방지를 위해 경영 실무진이 취해야 할 전략적 제언을 논리적으로 제안해 주세요.
+"""
+
+try:
+    # 최신 google-genai 라이브러리 인터페이스 적용
+    client = genai.Client(api_key=API_KEY)
+    
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt_content,
+        config=types.GenerateContentConfig(
+            temperature=0.2,  # 학술적이고 정확한 수치 해석을 위해 낮게 설정
+        )
+    )
+    
+    print("\n" + "="*50)
+    print("■ 구조방정식 및 매개효과 분석 결과 통계 해석 보고서 ■")
+    print("="*50)
+    print(response.text)
+
+except Exception as e:
+    print(f"\nAPI 통신 중 오류가 발생했습니다: {e}")

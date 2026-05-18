@@ -1,0 +1,255 @@
+import pandas as pd
+import requests
+import googlemaps
+import datetime
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# =====================================================================
+# 1. 환경 설정 및 API 키 입력
+# =====================================================================
+FILE_PATH = r"C:\Users\user\Desktop\10_PAproject_10_3_Address.xlsx"
+OUTPUT_PATH = r"C:\Users\user\Desktop\10_PAproject_10_3_Branch_Assignment_Result.xlsx"
+
+# 회사 지점 정보
+BRANCHES = {
+    "지점1_강남": "서울특별시 강남구 테헤란로 231",
+    "지점2_종로": "서울특별시 종로구 세종대로 209",
+    "지점3_용산": "서울특별시 용산구 원효로 216"
+}
+
+# [필수] 발급받은 API 인증 정보를 입력하세요.
+NOTE_NAVER_CLIENT_ID = "YOUR_NAVER_CLIENT_ID"
+NOTE_NAVER_CLIENT_SECRET = "YOUR_NAVER_CLIENT_SECRET"
+NOTE_GOOGLE_API_KEY = "YOUR_GOOGLE_MAPS_API_KEY"
+
+# 네이버 API 헤더 설정
+naver_headers = {
+    "X-NCP-APIGW-API-KEY-ID": NOTE_NAVER_CLIENT_ID,
+    "X-NCP-APIGW-API-KEY": NOTE_NAVER_CLIENT_SECRET
+}
+
+# 구글 맵 클라이언트 초기화
+gmaps = googlemaps.Client(key=NOTE_GOOGLE_API_KEY)
+
+
+# =====================================================================
+# 2. 미래의 출퇴근 목표 시간 설정 (교통 예측용)
+# =====================================================================
+target_date = datetime.date.today() + datetime.timedelta(days=1)
+if target_date.weekday() == 5:    # 토요일이면 월요일로
+    target_date += datetime.timedelta(days=2)
+elif target_date.weekday() == 6:  # 일요일이면 월요일로
+    target_date += datetime.timedelta(days=1)
+
+dt_am = datetime.datetime.combine(target_date, datetime.time(7, 30))
+dt_pm = datetime.datetime.combine(target_date, datetime.time(18, 30))
+
+naver_time_am = dt_am.strftime("%Y-%m-%dT%H:%M:%S")
+naver_time_pm = dt_pm.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# =====================================================================
+# 3. API 관련 핵심 함수 정의
+# =====================================================================
+
+# [네이버] 주소 -> 위경도 좌표 변환
+def get_naver_coordinates(address):
+    url = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
+    params = {"query": address}
+    try:
+        response = requests.get(url, headers=naver_headers, params=params)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("addresses"):
+                lon = res_json["addresses"][0]["x"]
+                lat = res_json["addresses"][0]["y"]
+                return f"{lon},{lat}"
+    except Exception as e:
+        print(f"[네이버 지오코딩 에러] {e} - 주소: {address}")
+    return None
+
+# [네이버] 자차(Driving) 소요 시간 계산 (단위: 분)
+def get_naver_driving_time(start_coord, end_coord, departure_time):
+    url = "https://maps.apigw.ntruss.com/map-direction/v1/driving"
+    params = {
+        "start": start_coord,
+        "goal": end_coord,
+        "departure-time": departure_time
+    }
+    try:
+        response = requests.get(url, headers=naver_headers, params=params)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("route") and res_json["route"].get("traoptimal"):
+                duration_ms = res_json["route"]["traoptimal"][0]["summary"]["duration"]
+                return round(duration_ms / 1000 / 60, 1)
+    except Exception as e:
+        print(f"[네이버 경로 에러] {e}")
+    return None
+
+# [구글] 대중교통(Transit) 소요 시간 계산 (단위: 분)
+def get_google_transit_time(origin, destination, departure_time):
+    try:
+        directions_result = gmaps.directions(
+            origin, destination, mode="transit", departure_time=departure_time, language="ko"
+        )
+        if directions_result:
+            duration_seconds = directions_result[0]['legs'][0]['duration']['value']
+            return round(duration_seconds / 60, 1)
+    except Exception as e:
+        print(f"[구글 경로 에러] {e} - 출발지: {origin}")
+    return None
+
+
+# =====================================================================
+# 4. 메인 분석 및 계산 로직
+# =====================================================================
+
+print("1. HR 데이터 로드 및 대상자 필터링...")
+df = pd.read_excel(FILE_PATH)
+df_target = df[df['gtw'].isin(['driving', 'transit'])].copy()
+
+if df_target.empty:
+    print("[오류] 분석 대상 직원(driving 또는 transit)이 없습니다.")
+else:
+    print(f"총 {len(df_target)}명의 직원을 대상으로 지점별 소요 시간을 계산합니다.")
+    
+    # 지점 3곳의 네이버 좌표 미리 획득 (자차 계산용)
+    branch_naver_coords = {}
+    for name, addr in BRANCHES.items():
+        branch_naver_coords[name] = get_naver_coordinates(addr)
+
+    # 결과를 저장할 딕셔너리 구조 생성
+    results_data = {col: [] for col in df_target.columns}
+    for name in BRANCHES.keys():
+        results_data[f"{name}_출근"] = []
+        results_data[f"{name}_퇴근"] = []
+        results_data[f"{name}_왕복"] = []
+        
+    # 직원별 최소 소요 시간 지점을 기록할 리스트
+    best_branches = []
+    min_commute_times = []
+
+    print("2. 직원별 각 지점 통근 시간 분석 중 (API 호출)...")
+    for idx, row in df_target.iterrows():
+        home_address = row['address']
+        gtw_mode = row['gtw']
+        
+        # 기본 정보 복사
+        for col in df_target.columns:
+            results_data[col].append(row[col])
+            
+        # 임시로 해당 직원의 각 지점별 왕복 시간을 담을 딕셔너리
+        row_totals = {}
+        
+        for name, branch_address in BRANCHES.items():
+            am_time, pm_time, total_time = None, None, None
+            
+            # Case 1: 자차 이용자 (네이버 API)
+            if gtw_mode == 'driving':
+                home_coord = get_naver_coordinates(home_address)
+                b_coord = branch_naver_coords[name]
+                if home_coord and b_coord:
+                    am_time = get_naver_driving_time(home_coord, b_coord, naver_time_am)
+                    pm_time = get_naver_driving_time(b_coord, home_coord, naver_time_pm)
+            
+            # Case 2: 대중교통 이용자 (구글 API)
+            elif gtw_mode == 'transit':
+                am_time = get_google_transit_time(home_address, branch_address, dt_am)
+                pm_time = get_google_transit_time(branch_address, home_address, dt_pm)
+                
+            if am_time is not None and pm_time is not None:
+                total_time = round(am_time + pm_time, 1)
+                row_totals[name] = total_time  # 비교를 위해 저장
+                
+            results_data[f"{name}_출근"].append(am_time)
+            results_data[f"{name}_퇴근"].append(pm_time)
+            results_data[f"{name}_왕복"].append(total_time)
+            
+        # 3) 개인별 출퇴근 시간이 최소가 되는 지점 찾기
+        if row_totals:
+            # 왕복 시간이 가장 적은 지점명 추출
+            best_br = min(row_totals, key=row_totals.get)
+            min_time = row_totals[best_br]
+            best_branches.append(best_br.split('_')[1]) # '지점1_강남'에서 '강남'만 추출
+            min_commute_times.append(min_time)
+        else:
+            best_branches.append("계산실패")
+            min_commute_times.append(None)
+
+    # 데이터프레임 구조로 병합 및 최종 판단 열 추가
+    df_result = pd.DataFrame(results_data)
+    df_result['최적배치지점'] = best_branches
+    df_result['최소왕복시간_분'] = min_commute_times
+
+    # =====================================================================
+    # 5. 서식을 적용하여 깔끔한 하나의 엑셀 파일로 저장
+    # =====================================================================
+    print("3. 분석 결과를 바탕으로 최적화 서식 엑셀 파일 생성 중...")
+    with pd.ExcelWriter(OUTPUT_PATH, engine='openpyxl') as writer:
+        df_result.to_excel(writer, sheet_name='직원별_지점배치분석', index=False)
+        
+        workbook = writer.book
+        worksheet = writer.sheets['직원별_지점배치분석']
+        
+        # 스타일 요소 정의
+        header_fill = PatternFill(start_color="333F48", end_color="333F48", fill_type="solid") # 진한 회색
+        fill_b1 = PatternFill(start_color="F2DCDB", end_color="F2DCDB", fill_type="solid")      # 연분홍 (강남)
+        fill_b2 = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")      # 연초록 (종로)
+        fill_b3 = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")      # 연노랑 (용산)
+        fill_best = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")    # 연파랑 (최적지점)
+        
+        font_header = Font(name="맑은 고딕", size=11, bold=True, color="FFFFFF")
+        font_data = Font(name="맑은 고딕", size=10)
+        font_bold_res = Font(name="맑은 고딕", size=10, bold=True, color="002060")
+        
+        align_center = Alignment(horizontal="center", vertical="center")
+        align_right = Alignment(horizontal="right", vertical="center")
+        
+        thin_border = Border(
+            left=Side(style='thin', color='D9D9D9'), right=Side(style='thin', color='D9D9D9'),
+            top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9')
+        )
+        
+        # 헤더 채우기 색상 분할 및 배치
+        for col_idx, col_name in enumerate(df_result.columns, 1):
+            cell = worksheet.cell(row=1, column=col_idx)
+            cell.font = font_header
+            cell.alignment = align_center
+            
+            if "지점1" in col_name:
+                cell.fill = fill_b1; cell.font = Font(name="맑은 고딕", size=11, bold=True, color="000000")
+            elif "지점2" in col_name:
+                cell.fill = fill_b2; cell.font = Font(name="맑은 고딕", size=11, bold=True, color="000000")
+            elif "지점3" in col_name:
+                cell.fill = fill_b3; cell.font = Font(name="맑은 고딕", size=11, bold=True, color="000000")
+            elif "최적" or "최소" in col_name:
+                cell.fill = fill_best; cell.font = Font(name="맑은 고딕", size=11, bold=True, color="000000")
+            else:
+                cell.fill = header_fill
+                
+        # 데이터 서식 세부 지정
+        for row in worksheet.iter_rows(min_row=2, max_row=len(df_result)+1):
+            for cell in row:
+                cell.font = font_data
+                cell.border = thin_border
+                
+                # 가독성을 위해 숫자는 우측 정렬 및 소수점 포맷
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '#,##0.0'
+                    cell.alignment = align_right
+                else:
+                    cell.alignment = align_center
+            
+            # 맨 오른쪽 핵심 결과 컬럼 강조
+            worksheet.cell(row=cell.row, column=df_result.columns.get_loc('최적배치지점')+1).font = font_bold_res
+            worksheet.cell(row=cell.row, column=df_result.columns.get_loc('최소왕복시간_분')+1).font = font_bold_res
+
+        # 열 너비 자동 맞춤
+        for col in worksheet.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = get_column_letter(col[0].column)
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 11)
+
+    print(f"\n[분석 완료] 결과 파일이 정상적으로 저장되었습니다:\n{OUTPUT_PATH}")
