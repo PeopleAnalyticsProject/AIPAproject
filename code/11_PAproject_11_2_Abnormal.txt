@@ -1,0 +1,311 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from pmdarima import auto_arima
+from prophet import Prophet
+
+
+def generate_recruit_forecast(file_path, output_html="forecast_result.html"):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"엑셀 파일을 찾을 수 없습니다: {file_path}")
+
+    print("채용 데이터를 로드하는 중...")
+    df = pd.read_excel(file_path, sheet_name='timeseries')
+
+    # 날짜 정렬 및 전체 합계 시계열 생성
+    df['date'] = pd.to_datetime(df['date'])
+    df_total = df.groupby('date')['posting_count'].sum().sort_index().reset_index()
+
+    # ----------------------------------------------------
+    # [모델링 1] ARIMA 예측 (auto_arima 기반)
+    # ----------------------------------------------------
+    print("ARIMA 모델 최적화 및 예측 진행 중...")
+    ts_arima = df_total.set_index('date')['posting_count'].asfreq('MS')
+
+    # 최적 파라미터 자동 탐색 (m=12: 월별 데이터의 연간 주기성 반영)
+    arima_model = auto_arima(ts_arima, seasonal=True, m=12, suppress_warnings=True, error_action="ignore")
+
+    # 향후 12개월 예측 및 신뢰구간 도출
+    forecast_periods = 12
+    arima_pred, arima_conf = arima_model.predict(n_periods=forecast_periods, return_conf_int=True, alpha=0.05)
+
+    # 미래 날짜 생성
+    future_dates = pd.date_range(start=ts_arima.index[-1] + pd.DateOffset(months=1), periods=forecast_periods,
+                                 freq='MS')
+
+    # ----------------------------------------------------
+    # [모델링 2] Prophet 예측 (전체 합계 기준)
+    # ----------------------------------------------------
+    print("Prophet 모델 전체 합계 예측 진행 중...")
+    df_prophet_in = df_total.rename(columns={'date': 'ds', 'posting_count': 'y'})
+
+    # 모델 정의 및 연간 계절성 강제 활성화
+    m = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+    m.fit(df_prophet_in)
+
+    # 12개월 미래 프레임 생성 및 예측
+    future = m.make_future_dataframe(periods=forecast_periods, freq='MS')
+    forecast_all = m.predict(future)
+
+    # ----------------------------------------------------
+    # [모델링 3] 모델 성능 평가 (과거 데이터 내 적합도 점수)
+    # ----------------------------------------------------
+    # ARIMA 과거 내 적합값(In-sample fitted values)
+    arima_fitted = arima_model.predict_in_sample()
+    # Prophet 과거 내 적합값
+    prophet_fitted = forecast_all.iloc[:-forecast_periods]['yhat'].values
+
+    actuals = df_total['posting_count'].values
+
+    # 평가지표 연산
+    metrics = {
+        'ARIMA': {
+            'RMSE': round(np.sqrt(mean_squared_error(actuals, arima_fitted)), 2),
+            'MAE': round(mean_absolute_error(actuals, arima_fitted), 2)
+        },
+        'Prophet': {
+            'RMSE': round(np.sqrt(mean_squared_error(actuals, prophet_fitted)), 2),
+            'MAE': round(mean_absolute_error(actuals, prophet_fitted), 2)
+        }
+    }
+
+    # ----------------------------------------------------
+    # [모델링 4] 직종별 Prophet 예측 데이터 사전 생성
+    # ----------------------------------------------------
+    print("직종별 Prophet 예측 데이터 생성 중...")
+    job_categories = sorted(df['job_category'].unique().tolist())
+    job_forecast_dict = {}
+
+    for jc in job_categories:
+        df_jc = df[df['job_category'] == jc].groupby('date')['posting_count'].sum().sort_index().reset_index()
+        df_jc_in = df_jc.rename(columns={'date': 'ds', 'posting_count': 'y'})
+
+        m_jc = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+        m_jc.fit(df_jc_in)
+
+        future_jc = m_jc.make_future_dataframe(periods=forecast_periods, freq='MS')
+        forecast_jc = m_jc.predict(future_jc)
+
+        job_forecast_dict[jc] = {
+            'history_ds': df_jc['date'].dt.strftime('%Y-%m-%d').tolist(),
+            'history_y': df_jc['posting_count'].tolist(),
+            'future_ds': forecast_jc.iloc[-forecast_periods:]['ds'].dt.strftime('%Y-%m-%d').tolist(),
+            'future_yhat': forecast_jc.iloc[-forecast_periods:]['yhat'].round(1).tolist(),
+            'future_yhat_lower': forecast_jc.iloc[-forecast_periods:]['yhat_lower'].round(1).tolist(),
+            'future_yhat_upper': forecast_jc.iloc[-forecast_periods:]['yhat_upper'].round(1).tolist(),
+        }
+
+    # ----------------------------------------------------
+    # 프론트엔드용 JSON 패킹 및 웹 컴포넌트 데이터 바인딩
+    # ----------------------------------------------------
+    history_dates_str = df_total['date'].dt.strftime('%Y-%m-%d').tolist()
+    future_dates_str = future_dates.strftime('%Y-%m-%d').tolist()
+
+    prophet_trend = forecast_all['trend'].tolist()
+    prophet_yearly = forecast_all['yearly'].tolist()
+    all_ds_str = forecast_all['ds'].dt.strftime('%Y-%m-%d').tolist()
+
+    # [수정 지점] arima_conf.iloc[:, 0] 대신 넘파이 배열 인덱싱 문법인 arima_conf[:, 0] 사용
+    html_content = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>채용 수요 인공지능 예측 분석 리포트</title>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        body {{
+            font-family: 'Malgun Gothic', 'Segoe UI', sans-serif;
+            background-color: #f8fafc; margin: 0; padding: 25px; color: #1e293b;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #4338ca, #1e1b4b);
+            color: white; padding: 30px; border-radius: 12px; margin-bottom: 30px;
+        }}
+        .header h1 {{ margin: 0; font-size: 26px; font-weight: 700; }}
+        .header p {{ margin: 8px 0 0 0; color: #c7d2fe; font-size: 14px; }}
+        .grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 25px; }}
+        .card {{ background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 22px; }}
+        .full {{ grid-column: span 2; }}
+        h3 {{ margin-top: 0; color: #0f172a; font-size: 18px; border-bottom: 2px solid #f1f5f9; padding-bottom: 10px; }}
+        .metric-table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+        .metric-table th, .metric-table td {{ border: 1px solid #e2e8f0; padding: 12px; text-align: center; }}
+        .metric-table th {{ background-color: #f1f5f9; font-weight: bold; }}
+        .filter-box {{ background: #f1f5f9; padding: 15px; border-radius: 6px; margin-bottom: 15px; }}
+        select {{ padding: 8px 16px; border-radius: 4px; border: 1px solid #cbd5e1; font-size: 14px; width: 250px; }}
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>🔮 AI 기반 채용 공고 수요 예측 리포트</h1>
+        <p>전통 통계 기반 ARIMA 모델과 시계열 딥러닝 아키텍처 Prophet을 결합한 12개월 선행 수요 예측 대시보드</p>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h3>1. 전체 채용공고 기준 ARIMA 예측 모델 결과</h3>
+            <div id="chart-arima" style="height: 400px;"></div>
+        </div>
+
+        <div class="card">
+            <h3>2. 전체 채용공고 기준 Prophet 예측 모델 결과</h3>
+            <div id="chart-prophet" style="height: 400px;"></div>
+        </div>
+
+        <div class="card full">
+            <h3>3. ARIMA vs Prophet 예측 모델 정밀 비교평가</h3>
+            <table class="metric-table">
+                <thead>
+                    <tr>
+                        <th>예측 분석 모델 (Model Name)</th>
+                        <th>RMSE (오차 제곱근 평균 - 낮을수록 우수)</th>
+                        <th>MAE (절대 오차 평균 - 낮을수록 우수)</th>
+                        <th>알고리즘 특징</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><b>ARIMA (Auto-SARIMAX)</b></td>
+                        <td>{metrics['ARIMA']['RMSE']}</td>
+                        <td>{metrics['ARIMA']['MAE']}</td>
+                        <td>단기 변동 추종 및 자체 과거 잔차 패턴 학습에 특화</td>
+                    </tr>
+                    <tr>
+                        <td><b>Prophet (Facebook)</b></td>
+                        <td>{metrics['Prophet']['RMSE']}</td>
+                        <td>{metrics['Prophet']['MAE']}</td>
+                        <td>장기 트렌드 변화 및 연간 계절성(명절, 휴일 효과 등) 분해에 특화</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div id="chart-comparison" style="height: 400px; margin-top: 20px;"></div>
+        </div>
+
+        <div class="card full">
+            <h3>4. Prophet 시계열 데이터 내부 성분 분해 (Decomposition)</h3>
+            <div id="chart-components" style="height: 450px;"></div>
+        </div>
+
+        <div class="card full">
+            <h3>🎯 5. 직종군별 세부 12개월 선행 채용 수요 예측</h3>
+            <div class="filter-box">
+                <label for="job-selector"><b>조회할 직종 선택:</b> </label>
+                <select id="job-selector" onchange="updateJobForecastChart()"></select>
+            </div>
+            <div id="chart-job-forecast" style="height: 450px;"></div>
+        </div>
+    </div>
+
+    <script>
+        const historyDates = {json.dumps(history_dates_str)};
+        const futureDates = {json.dumps(future_dates_str)};
+        const actuals = {json.dumps(df_total['posting_count'].tolist())};
+
+        const arimaPred = {json.dumps(arima_pred.tolist())};
+        // [수정 적용 완료 지점]
+        const arimaLower = {json.dumps(arima_conf[:, 0].tolist())};
+        const arimaUpper = {json.dumps(arima_conf[:, 1].tolist())};
+
+        const prophetDatesAll = {json.dumps(all_ds_str)};
+        const prophetTrend = {json.dumps(prophet_trend)};
+        const prophetYearly = {json.dumps(prophet_yearly)};
+        const prophetYhat = {json.dumps(forecast_all['yhat'].tolist())};
+        const prophetLower = {json.dumps(forecast_all['yhat_lower'].tolist())};
+        const prophetUpper = {json.dumps(forecast_all['yhat_upper'].tolist())};
+
+        const jobForecasts = {json.dumps(job_forecast_dict, ensure_ascii=False)};
+
+        window.onload = function() {{
+            renderARIMA();
+            renderProphet();
+            renderComparison();
+            renderComponents();
+            initJobDropdown();
+        }};
+
+        function renderARIMA() {{
+            const traceAct = {{ x: historyDates, y: actuals, mode: 'lines+markers', name: '실제 채용공고', line: {{ color: '#1e293b' }} }};
+            const tracePred = {{ x: futureDates, y: arimaPred, mode: 'lines+markers', name: 'ARIMA 미래예측', line: {{ color: '#4338ca', width: 3 }} }};
+            const traceUpper = {{ x: futureDates, y: arimaUpper, mode: 'lines', line: {{ width: 0 }}, showlegend: false }};
+            const traceLower = {{ x: futureDates, y: arimaLower, mode: 'lines', fill: 'tonexty', fillcolor: 'rgba(67, 56, 202, 0.1)', line: {{ width: 0 }}, name: '95% 신뢰구간' }};
+
+            Plotly.newPlot('chart-arima', [traceAct, tracePred, traceUpper, traceLower], {{ template: 'plotly_white', margin: {{ t:20, b:40, l:50, r:20 }} }});
+        }}
+
+        function renderProphet() {{
+            const pFutureDates = prophetDatesAll.slice(-12);
+            const pFutureYhat = prophetYhat.slice(-12);
+            const pFutureLower = prophetLower.slice(-12);
+            const pFutureUpper = prophetUpper.slice(-12);
+
+            const traceAct = {{ x: historyDates, y: actuals, mode: 'lines+markers', name: '실제 채용공고', line: {{ color: '#1e293b' }} }};
+            const tracePred = {{ x: pFutureDates, y: pFutureYhat, mode: 'lines+markers', name: 'Prophet 미래예측', line: {{ color: '#06b6d4', width: 3 }} }};
+            const traceUpper = {{ x: pFutureDates, y: pFutureUpper, mode: 'lines', line: {{ width: 0 }}, showlegend: false }};
+            const traceLower = {{ x: pFutureDates, y: pFutureLower, mode: 'lines', fill: 'tonexty', fillcolor: 'rgba(6, 182, 212, 0.1)', line: {{ width: 0 }}, name: '신뢰구간' }};
+
+            Plotly.newPlot('chart-prophet', [traceAct, tracePred, traceUpper, traceLower], {{ template: 'plotly_white', margin: {{ t:20, b:40, l:50, r:20 }} }});
+        }}
+
+        function renderComparison() {{
+            const traceAct = {{ x: historyDates, y: actuals, mode: 'lines', name: '실제 공고 데이터(Actual)', line: {{ color: '#0f172a', width: 2 }} }};
+            const traceArima = {{ x: futureDates, y: arimaPred, mode: 'lines+markers', name: 'ARIMA 모델 예측선', line: {{ color: '#4338ca', dash: 'dash' }} }};
+            const traceProphet = {{ x: prophetDatesAll.slice(-12), y: prophetYhat.slice(-12), mode: 'lines+markers', name: 'Prophet 모델 예측선', line: {{ color: '#06b6d4', dash: 'dot' }} }};
+
+            Plotly.newPlot('chart-comparison', [traceAct, traceArima, traceProphet], {{
+                title: '<b>ARIMA vs Prophet 미래 12개월 예측 궤적 비교</b>',
+                template: 'plotly_white', hovermode: 'x unified'
+            }});
+        }}
+
+        function renderComponents() {{
+            const traceTrend = {{ x: prophetDatesAll, y: prophetTrend, mode: 'lines', name: '장기 추세(Trend)', line: {{ color: '#ec4899' }} }};
+            const traceSeasonal = {{ x: prophetDatesAll, y: prophetYearly, mode: 'lines', name: '연간 순수 계절성(Seasonal)', line: {{ color: '#10b981' }} }};
+
+            Plotly.newPlot('chart-components', [traceTrend, traceSeasonal], {{
+                yaxis: {{ title: '기여 건수 변동폭' }},
+                template: 'plotly_white', hovermode: 'x unified'
+            }});
+        }}
+
+        function initJobDropdown() {{
+            const selector = document.getElementById('job-selector');
+            const jobs = Object.keys(jobForecasts).sort();
+
+            jobs.forEach(job => {{
+                const opt = document.createElement('option');
+                opt.value = job; opt.innerText = job;
+                selector.appendChild(opt);
+            }});
+            updateJobForecastChart();
+        }}
+
+        function updateJobForecastChart() {{
+            const selectedJob = document.getElementById('job-selector').value;
+            const data = jobForecasts[selectedJob];
+
+            const traceAct = {{ x: data.history_ds, y: data.history_y, mode: 'lines+markers', name: '과거 실제 데이터', line: {{ color: '#64748b' }} }};
+            const tracePred = {{ x: data.future_ds, y: data.future_yhat, mode: 'lines+markers', name: 'Prophet 미래 예측', line: {{ color: '#f59e0b', width: 3 }} }};
+            const traceUpper = {{ x: data.future_ds, y: data.future_yhat_upper, mode: 'lines', line: {{ width: 0 }}, showlegend: false }};
+            const traceLower = {{ x: data.future_ds, y: data.future_yhat_lower, mode: 'lines', fill: 'tonexty', fillcolor: 'rgba(245, 158, 11, 0.1)', line: {{ width: 0 }}, name: '예측 오차 신뢰구간' }};
+
+            Plotly.newPlot('chart-job-forecast', [traceAct, tracePred, traceUpper, traceLower], {{
+                title: `<b>${{selectedJob}} - 향후 12개월 채용 수요 선행 예측 곡선</b>`,
+                template: 'plotly_white', hovermode: 'x unified'
+            }});
+        }}
+    </script>
+</body>
+</html>
+"""
+
+    print(f"인터랙티브 AI 예측 리포트 저장 중: {output_html}")
+    with open(output_html, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    print("예측 대시보드 파일 빌드 완료!")
+
+
+if __name__ == "__main__":
+    EXCEL_PATH = r"C:\Users\user\Desktop\11_PAproject_11_1_recruit.xlsx"
+    generate_recruit_forecast(EXCEL_PATH)

@@ -1,0 +1,137 @@
+import os
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as gr
+import ruptures as rpt
+
+
+def perform_cpd_analysis(file_path, output_html="changepoint_result.html"):
+    # 1. 데이터 로드 및 전처리
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"엑셀 파일을 찾을 수 없습니다: {file_path}")
+
+    print("데이터를 로드하는 중...")
+    df = pd.read_excel(file_path, sheet_name='timeseries')
+
+    # 날짜 형식 변환 및 정렬
+    df['date'] = pd.to_datetime(df['date'])
+    df_total = df.groupby('date')['posting_count'].sum().sort_index().reset_index()
+
+    signal = df_total['posting_count'].values
+    dates = df_total['date'].values
+
+    # Plotly 호환성을 위해 날짜를 'YYYY-MM-DD' 문자열 배열로도 준비
+    dates_str = df_total['date'].dt.strftime('%Y-%m-%d').values
+
+    # 2. Change Point Detection (PELT 알고리즘) 적용
+    print("PELT 알고리즘 기반 변곡점 탐지 중...")
+    algo = rpt.Pelt(model="l2").fit(signal)
+
+    # penalty 수치를 조절하여 변곡점 탐지의 민감도를 제어할 수 있습니다.
+    result = algo.predict(pen=2)
+    change_points = result[:-1]
+
+    print(f"탐지된 변곡점 인덱스 위치: {change_points}")
+
+    # 3. Plotly 인터랙티브 그래프 생성
+    fig = gr.Figure()
+
+    # 1) 원본 채용공고 시계열 라인 추가 (X축에 문자열 날짜 사용으로 호환성 확보)
+    fig.add_trace(
+        gr.Scatter(
+            x=dates_str, y=signal,
+            mode='lines+markers',
+            name='실제 공고수',
+            line=dict(color='#162447', width=2),
+            marker=dict(size=5)
+        )
+    )
+
+    # 2) 구간별 평균선 계산 및 채우기 (구간 색상 구분)
+    indices = [0] + change_points + [len(signal)]
+    colors = ['rgba(31, 64, 104, 0.15)', 'rgba(228, 63, 90, 0.15)',
+              'rgba(16, 185, 129, 0.15)', 'rgba(245, 158, 11, 0.15)', 'rgba(139, 92, 246, 0.15)']
+
+    for i in range(len(indices) - 1):
+        start_idx = indices[i]
+        end_idx = indices[i + 1]
+
+        segment_y = signal[start_idx:end_idx]
+        segment_mean = np.mean(segment_y)
+        segment_dates_str = dates_str[start_idx:end_idx]
+
+        if end_idx < len(dates_str):
+            plot_dates = np.append(segment_dates_str, dates_str[end_idx])
+            plot_means = [segment_mean] * len(plot_dates)
+        else:
+            plot_dates = segment_dates_str
+            plot_means = [segment_mean] * len(plot_dates)
+
+        color_idx = i % len(colors)
+
+        # 구간 평균 수평선 추가
+        fig.add_trace(
+            gr.Scatter(
+                x=plot_dates, y=plot_means,
+                mode='lines',
+                name=f'구간 {i + 1} 평균 ({int(segment_mean):,}건)',
+                line=dict(color=colors[color_idx].replace('0.15', '1.0'), width=3, dash='dash'),
+            )
+        )
+
+        # 구간 범위 배경 음영 추가
+        fig.add_vrect(
+            x0=dates_str[start_idx],
+            x1=dates_str[end_idx - 1 if end_idx < len(dates_str) else -1],
+            fillcolor=colors[color_idx],
+            layer="below",
+            line_width=0,
+        )
+
+    # 3) 탐지된 변곡점 위치에 레이아웃 셰이프(Shape) 방식으로 안전하게 수직선 추가
+    for cp in change_points:
+        cp_date_str = dates_str[cp]
+        cp_label = pd.to_datetime(cp_date_str).strftime('%Y-%m')
+
+        # 에러가 나던 add_vline 대신 형식을 지정한 수직선 연출
+        fig.add_shape(
+            type="line",
+            x0=cp_date_str, y0=0, x1=cp_date_str, y1=1,
+            yref="paper",  # y축은 차트의 바닥(0)부터 꼭대기(1)까지 꽉 채움
+            line=dict(color="#ef4444", width=2, dash="dot")
+        )
+
+        # 변곡점 글자 텍스트 라벨 추가
+        fig.add_annotation(
+            x=cp_date_str,
+            y=1.02,  # 차트 본문보다 살짝 위에 배치
+            yref="paper",
+            text=f"<b>변곡점: {cp_label}</b>",
+            showarrow=False,
+            font=dict(color="#ef4444", size=11),
+            xanchor="left"
+        )
+
+    # 4. 전체 레이아웃 정제
+    fig.update_layout(
+        title=dict(
+            text="<b>채용수요 시계열 변곡점 탐지 (PELT 알고리즘 분석 결과)</b><br><span style='font-size:13px; color:#64748b;'>* 음영 및 점선: 채용 시장의 구조적 변화(평균 이동)가 발생한 시점과 구간별 평균선</span>",
+            x=0.5, y=0.94, font=dict(size=20)
+        ),
+        xaxis=dict(title="연월 (Date)", gridcolor='#e2e8f0', type='category'),  # 'category' 형식으로 지정해 공백 차단
+        yaxis=dict(title="공고 수 합계 (건)", gridcolor='#e2e8f0'),
+        margin=dict(t=100, b=60, l=60, r=40),
+        height=650,
+        template="plotly_white",
+        hovermode="x unified"
+    )
+
+    # 5. 결과 HTML 파일 저장
+    print(f"인터랙티브 리포트를 저장하는 중: {output_html}")
+    fig.write_html(output_html, include_plotlyjs='cdn')
+    print("변곡점 분석 시각화 페이지 생성 완료!")
+
+
+if __name__ == "__main__":
+    EXCEL_PATH = r"C:\Users\user\Desktop\11_PAproject_11_1_recruit.xlsx"
+    perform_cpd_analysis(EXCEL_PATH)

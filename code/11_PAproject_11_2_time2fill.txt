@@ -1,0 +1,259 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+
+def analyze_time_to_fill(file_path, output_html="time_to_fill.html"):
+    # 1. 데이터 로드
+    if not os.path.exists(file_path):
+        possible_paths = [file_path, file_path.replace("11_1_recruit", "11_2_pipeline")]
+        for p in possible_paths:
+            if os.path.exists(p):
+                file_path = p
+                break
+        else:
+            raise FileNotFoundError(f"엑셀 파일을 찾을 수 없습니다: {file_path}")
+            
+    print("채용 파이프라인 데이터를 로드하는 중...")
+    df = pd.read_excel(file_path, sheet_name='pipeline')
+
+    # 2. 데이터 필터링 및 전처리 (조건: result가 합격인 행만, time_to_fill 유효 데이터만)
+    df['result'] = df['result'].astype(str).str.strip()
+    df_filtered = df[
+        df['result'].str.contains('합격|Pass|pass|통과', na=False) & 
+        df['time_to_fill'].notna()
+    ].copy()
+    
+    # 정렬 (시계열 추이용)
+    df_filtered = df_filtered.sort_values(by='ym')
+
+    # --- [차트 데이터 사전 연산] ---
+    # 1) 전체 분포 통계량
+    ttf_series = df_filtered['time_to_fill'].astype(float)
+    ttf_mean = float(ttf_series.mean())
+    ttf_median = float(ttf_series.median())
+    
+    # 2) 직종별 데이터 목록
+    job_groups = df_filtered.groupby('job_category')
+    box_data = []
+    for name, group in job_groups:
+        box_data.append({
+            'job_category': str(name),
+            'values': group['time_to_fill'].astype(float).tolist()
+        })
+        
+    # 3) 월별(ym) 추이 데이터
+    df_month = df_filtered.groupby('ym')['time_to_fill'].mean().reset_index()
+    month_data = {
+        'ym': df_month['ym'].astype(str).tolist(),
+        'avg_ttf': df_month['time_to_fill'].round(1).tolist()
+    }
+    
+    # 4) 연도별(year) 평균 데이터
+    df_year = df_filtered.groupby('year')['time_to_fill'].mean().reset_index()
+    year_data = {
+        'year': df_year['year'].astype(int).astype(str).tolist(),
+        'avg_ttf': df_year['time_to_fill'].round(1).tolist()
+    }
+
+    # Raw Data 전체 (히스토그램용)
+    raw_ttf_list = ttf_series.tolist()
+
+    # 3. HTML & Plotly 통합 대시보드 템플릿 작성
+    # 문법 충돌을 방지하기 위해 자바스크립트의 템플릿 리터럴(${}) 대신 일반 문자열 결합을 사용했습니다.
+    html_content = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>채용 소요 기간 (Time-to-Fill) 정밀 분석</title>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        body {{
+            font-family: 'Malgun Gothic', 'Segoe UI', sans-serif;
+            background-color: #f8fafc;
+            margin: 0; padding: 25px;
+            color: #1e293b;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #0d9488, #115e59);
+            color: white; padding: 30px;
+            border-radius: 12px; margin-bottom: 30px;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+        }}
+        .header h1 {{ margin: 0; font-size: 26px; font-weight: 700; }}
+        .header p {{ margin: 8px 0 0 0; color: #ccfbf1; font-size: 14px; }}
+        .grid {{
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 25px;
+        }}
+        .card {{
+            background: white; border: 1px solid #e2e8f0;
+            border-radius: 10px; padding: 22px;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.03);
+        }}
+        .full {{ grid-column: span 2; }}
+        h3 {{ margin-top: 0; color: #0f172a; font-size: 18px; border-bottom: 2px solid #f1f5f9; padding-bottom: 10px; }}
+        .metrics-summary {{
+            display: flex; gap: 20px; margin-bottom: 15px;
+        }}
+        .metric {{
+            background: #f0fdfa; border: 1px solid #99f6e4;
+            padding: 10px 20px; border-radius: 6px;
+            font-size: 14px; font-weight: bold; color: #115e59;
+        }}
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>⏳ HR 채용 소요 기간 (Time-to-Fill) 핵심 지표 분석</h1>
+        <p>분석 대상: 최종 합격 판정을 받은 포지션별 공고 게시일 ~ 채용 확정일 간격 (Days)</p>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h3>1. Time-to-Fill 전체 분포 (통계량)</h3>
+            <div class="metrics-summary">
+                <div class="metric">📊 전체 평균: {ttf_mean:.1f} 일</div>
+                <div class="metric">📍 중앙값: {ttf_median:.1f} 일</div>
+            </div>
+            <div id="chart-hist" style="height: 380px;"></div>
+        </div>
+
+        <div class="card">
+            <h3>2. 주요 직종별 채용 소요 기간 비교</h3>
+            <div id="chart-box" style="height: 435px;"></div>
+        </div>
+
+        <div class="card full">
+            <h3>3. 월별 평균 채용 소요 기간(Time-to-Fill) 시계열 트렌드</h3>
+            <div id="chart-line" style="height: 380px;"></div>
+        </div>
+
+        <div class="card full">
+            <h3>4. 연도별 평균 채용 소요 기간 변동 비교</h3>
+            <div id="chart-year-bar" style="height: 380px;"></div>
+        </div>
+    </div>
+
+    <script>
+        // 파이썬 전처리 데이터 주입
+        const rawTtf = {json.dumps(raw_ttf_list)};
+        const boxData = {json.dumps(box_data, ensure_ascii=False)};
+        const monthData = {json.dumps(month_data)};
+        const yearData = {json.dumps(year_data)};
+        
+        const avgVal = {ttf_mean};
+        const medVal = {ttf_median};
+
+        // 1. 히스토그램 렌더링
+        function renderHistogram() {{
+            const trace = {{
+                x: rawTtf,
+                type: 'histogram',
+                name: '공고 수',
+                marker: {{ color: '#0d9488', opacity: 0.75 }},
+                xbins: {{ size: 5 }}
+            }};
+            
+            const layout = {{
+                xaxis: {{ title: '채용 소요 기간 (일)' }},
+                yaxis: {{ title: '채용 완료 건수' }},
+                margin: {{ l: 50, r: 20, t: 10, b: 40 }},
+                template: 'plotly_white',
+                shapes: [
+                    {{ type: 'line', xref: 'x', x0: avgVal, x1: avgVal, yref: 'paper', y0: 0, y1: 1, line: {{ color: '#ef4444', width: 2, dash: 'dash' }} }},
+                    {{ type: 'line', xref: 'x', x0: medVal, x1: medVal, yref: 'paper', y0: 0, y1: 1, line: {{ color: '#3b82f6', width: 2, dash: 'dot' }} }}
+                ],
+                annotations: [
+                    {{ xref: 'x', x: avgVal, yref: 'paper', y: 0.9, text: '평균: ' + avgVal.toFixed(1) + '일', showarrow: true, arrowheading: 1, arrowhead: 2, arrowcolor: '#ef4444', font: {{ color: '#ef4444', weight: 'bold' }}, bgcolor: 'white' }},
+                    {{ xref: 'x', x: medVal, yref: 'paper', y: 0.7, text: '중앙값: ' + medVal.toFixed(1) + '일', showarrow: true, arrowheading: 1, arrowhead: 2, arrowcolor: '#3b82f6', font: {{ color: '#3b82f6', weight: 'bold' }}, bgcolor: 'white' }}
+                ]
+            }};
+            Plotly.newPlot('chart-hist', [trace], layout);
+        }}
+
+        // 2. 박스 플롯 렌더링
+        function renderBoxPlot() {{
+            const traces = boxData.map(item => {{
+                return {{
+                    y: item.values,
+                    name: item.job_category,
+                    type: 'box',
+                    boxpoints: 'outliers',
+                    marker: {{ size: 3 }}
+                }};
+            }});
+
+            const layout = {{
+                yaxis: {{ title: '소요 기간 (일)' }},
+                xaxis: {{ automargin: true }},
+                margin: {{ l: 50, r: 20, t: 10, b: 60 }},
+                showlegend: false,
+                template: 'plotly_white'
+            }};
+            Plotly.newPlot('chart-box', traces, layout);
+        }}
+
+        // 3. 시계열 라인차트 렌더링
+        function renderLineChart() {{
+            const trace = {{
+                x: monthData.ym,
+                y: monthData.avg_ttf,
+                type: 'scatter',
+                mode: 'lines+markers',
+                line: {{ color: '#0f766e', width: 3 }},
+                marker: {{ size: 6, color: '#115e59' }}
+            }};
+
+            const layout = {{
+                xaxis: {{ title: '연월(YM)', type: 'category' }},
+                yaxis: {{ title: '평균 소요 기간 (일)' }},
+                margin: {{ l: 50, r: 20, t: 20, b: 40 }},
+                template: 'plotly_white',
+                hovermode: 'x unified'
+            }};
+            Plotly.newPlot('chart-line', [trace], layout);
+        }}
+
+        // 4. 연도별 바차트 렌더링
+        function renderBarChart() {{
+            const trace = {{
+                x: yearData.year,
+                y: yearData.avg_ttf,
+                type: 'bar',
+                text: yearData.avg_ttf.map(v => v + '일'),
+                textposition: 'auto',
+                marker: {{ color: '#14b8a6' }}
+            }};
+
+            const layout = {{
+                xaxis: {{ title: '연도 (Year)', type: 'category' }},
+                yaxis: {{ title: '평균 소요 기간 (일)' }},
+                margin: {{ l: 50, r: 20, t: 20, b: 40 }},
+                template: 'plotly_white'
+            }};
+            Plotly.newPlot('chart-year-bar', [trace], layout);
+        }}
+
+        // 대시보드 구동
+        window.onload = function() {{
+            renderHistogram();
+            renderBoxPlot();
+            renderLineChart();
+            renderBarChart();
+        }};
+    </script>
+</body>
+</html>
+"""
+
+    print(f"Time-to-Fill 분석 결과를 내보내는 중: {output_html}")
+    with open(output_html, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    print("통합 시각화 리포트 구축 완료!")
+
+if __name__ == "__main__":
+    EXCEL_PATH = r"C:\Users\user\Desktop\11_PAproject_11_2_pipeline.xlsx"
+    analyze_time_to_fill(EXCEL_PATH)
