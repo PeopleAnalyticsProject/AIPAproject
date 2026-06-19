@@ -1,7 +1,7 @@
 # AI 기반 People Analytics Project
 
 **국민대학교 경영대학 김철영 교수**  
-**Repository:** https://github.com/PeopleAnalyticsProject/project  
+**Repository:** https://github.com/PeopleAnalyticsProject/AIPAproject  
 **Contact:** Kimzinc@kookmin.ac.kr  
 
 본 저장소는 AI, 머신러닝, 통계분석, 공공데이터 API, 생성형 AI 프롬프트를 활용하여 실제 HR 및 People Analytics 문제를 분석하기 위한 교육·연구용 저장소입니다.
